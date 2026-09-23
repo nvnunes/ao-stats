@@ -8,7 +8,8 @@ unit-aware measurements, and where the package boundary ends.
 Every public calculation follows the same flow:
 
 1. Validate and shape a two-dimensional PSF or three-dimensional PSF cube.
-2. Validate `PsfMetadata` and any enclosed-energy apertures.
+2. Validate full `PsfMetadata`, or a pixel scale for EE/FWHM-only requests,
+   along with any enclosed-energy apertures.
 3. Apply the built-in clip-and-normalize preprocessing by default, or the
    caller's explicit preprocessing choice.
 4. Validate the prepared physical-flux contract required by selected metrics.
@@ -25,7 +26,7 @@ provide direct access to one measurement.
 
 AO Stats owns:
 
-- the neutral `PsfMetadata` contract;
+- the neutral full `PsfMetadata` contract and pixel-scale-only measurement path;
 - PSF input and physical-metadata validation required by its calculations;
 - the named clip-and-normalize preprocessing operation;
 - Strehl, enclosed-energy, and FWHM algorithms and their selectors; and
@@ -33,8 +34,8 @@ AO Stats owns:
 
 AO Stats does not own simulation lifecycle, dataset schemas, persistence,
 plotting, interpolation, or instrument-specific policy. Callers translate
-their own contracts into NumPy arrays, `PsfMetadata`, and aperture quantities
-before invoking the measurement API.
+their own contracts into NumPy arrays, full `PsfMetadata` when measuring
+Strehl, and aperture quantities before invoking the measurement API.
 
 ## Public API
 

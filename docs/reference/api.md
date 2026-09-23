@@ -6,7 +6,7 @@ The supported API is imported from the `ao_stats` package root.
 
 | Name | Contract |
 | --- | --- |
-| `PsfMetadata` | Physical metadata required by PSF measurements. |
+| `PsfMetadata` | Full physical metadata required for Strehl; EE and FWHM also accept a pixel scale alone. |
 | `StatValue` | Astropy quantity returned by a measurement function. |
 | `PsfMetricName` | Metric name: `"sr"`, `"ee"`, or `"fwhm"`. |
 | `PsfPreprocessor` | Callable that accepts and returns a PSF cube. |

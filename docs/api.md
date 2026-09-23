@@ -12,7 +12,7 @@ PSF data is a NumPy-compatible array with one of these shapes:
 - `[Ny, Nx]` for one PSF;
 - `[M, Ny, Nx]` for a cube of `M` PSFs.
 
-Every calculation also receives `PsfMetadata`:
+Strehl calculations require full `PsfMetadata`:
 
 ```python
 import numpy as np
@@ -60,6 +60,23 @@ When `metrics` is omitted, the result is `(sr, ee, fwhm)`. Pass a sequence of
 `"sr"`, `"ee"`, and `"fwhm"` to compute a subset; the returned tuple follows
 the requested order. The focused `compute_psf_sr`, `compute_psf_ee`, and
 `compute_psf_fwhm` functions return one measurement directly.
+
+Enclosed energy and FWHM need only the angular `pixel_scale`. Pass it instead
+of `metadata` when wavelength or pupil information is unavailable:
+
+```python
+ee, fwhm = compute_psf_stats(
+    psf,
+    pixel_scale=4.0 * u.mas,
+    ee_apertures=np.array([50.0, 100.0]) * u.mas,
+    metrics=("ee", "fwhm"),
+)
+```
+
+The focused `compute_psf_ee` and `compute_psf_fwhm` functions accept the same
+`pixel_scale` alternative. A scalar scale applies to every PSF; a vector must
+have one value per PSF. Supplying both `metadata` and `pixel_scale` is an error.
+Strehl cannot be requested through the pixel-scale-only path.
 
 ## Measurement Options
 

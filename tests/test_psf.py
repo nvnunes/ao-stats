@@ -246,6 +246,106 @@ def test_metric_subset_preserves_requested_order_and_units(monkeypatch) -> None:
     np.testing.assert_allclose(fwhm.value, np.full((2,), 6.0, dtype=np.float32))
 
 
+def test_pixel_scale_only_matches_full_metadata_for_scalar_ee_and_fwhm() -> None:
+    psf = _gaussian_psf(31, 31, 15.0, 15.0, 2.0, 2.5)
+    apertures = np.array([20.0, 40.0], dtype=np.float32) * u.mas
+
+    expected = compute_psf_stats(
+        psf,
+        _metadata(),
+        ee_apertures=apertures,
+        metrics=("ee", "fwhm"),
+    )
+    actual = compute_psf_stats(
+        psf,
+        pixel_scale=4.0 * u.mas,
+        ee_apertures=apertures,
+        metrics=("ee", "fwhm"),
+    )
+
+    for measured, reference in zip(actual, expected):
+        assert measured.unit == reference.unit
+        assert measured.dtype == reference.dtype
+        np.testing.assert_array_equal(measured.value, reference.value)
+
+
+def test_pixel_scale_only_cube_supports_per_psf_scales_and_apertures() -> None:
+    psf = _gaussian_psf(31, 31, 15.0, 15.0, 2.0, 2.0)
+    cube = np.stack((psf, psf))
+    scales = np.array([3.5, 4.5], dtype=np.float32) * u.mas
+    apertures = np.array([[15.0], [25.0]], dtype=np.float32) * u.mas
+
+    expected = compute_psf_stats(
+        cube,
+        _metadata(pixel_scale=scales.value),
+        ee_apertures=apertures,
+        metrics=("fwhm", "ee"),
+    )
+    actual = compute_psf_stats(
+        cube,
+        pixel_scale=scales,
+        ee_apertures=apertures,
+        metrics=("fwhm", "ee"),
+    )
+
+    assert actual[0].shape == (2,)
+    assert actual[1].shape == (2, 1)
+    for measured, reference in zip(actual, expected):
+        np.testing.assert_array_equal(measured.value, reference.value)
+
+
+def test_pixel_scale_only_wrappers_match_full_metadata() -> None:
+    psf = _gaussian_psf(31, 31, 15.0, 15.0, 2.0, 2.0)
+    apertures = np.array([20.0, 40.0], dtype=np.float32) * u.mas
+
+    ee = compute_psf_ee(psf, pixel_scale=4.0 * u.mas, ee_apertures=apertures)
+    ee_scalar = compute_psf_ee(
+        psf,
+        pixel_scale=4.0 * u.mas,
+        ee_apertures=apertures[:1],
+    )
+    fwhm = compute_psf_fwhm(psf, pixel_scale=4.0 * u.mas)
+
+    np.testing.assert_array_equal(
+        ee.value,
+        compute_psf_ee(psf, _metadata(), ee_apertures=apertures).value,
+    )
+    assert fwhm == compute_psf_fwhm(psf, _metadata())
+    assert ee_scalar.isscalar
+
+
+def test_pixel_scale_only_rejects_missing_or_conflicting_inputs() -> None:
+    psf = _gaussian_psf(31, 31, 15.0, 15.0, 2.0, 2.0)
+
+    with pytest.raises(ValueError, match="pixel_scale is required"):
+        compute_psf_stats(psf, metrics=("fwhm",))
+    with pytest.raises(ValueError, match="Strehl requires PsfMetadata"):
+        compute_psf_stats(psf, pixel_scale=4.0 * u.mas, metrics=("sr",))
+    with pytest.raises(ValueError, match="Strehl requires PsfMetadata"):
+        compute_psf_stats(psf, pixel_scale=4.0 * u.mas)
+    with pytest.raises(ValueError, match="Strehl requires PsfMetadata"):
+        compute_psf_stats(psf)
+    with pytest.raises(ValueError, match="metadata or pixel_scale"):
+        compute_psf_stats(
+            psf,
+            _metadata(),
+            pixel_scale=4.0 * u.mas,
+            metrics=("fwhm",),
+        )
+    with pytest.raises(ValueError, match="pixel_scale per-PSF vector length"):
+        compute_psf_stats(
+            np.stack((psf, psf)),
+            pixel_scale=np.array([4.0]) * u.mas,
+            metrics=("fwhm",),
+        )
+    with pytest.raises(TypeError, match="pixel_scale must be an Astropy"):
+        compute_psf_stats(psf, pixel_scale=4.0, metrics=("fwhm",))
+    with pytest.raises(ValueError, match="pixel_scale must have units equivalent"):
+        compute_psf_stats(psf, pixel_scale=4.0 * u.m, metrics=("fwhm",))
+    with pytest.raises(ValueError, match="pixel_scale must be finite and > 0"):
+        compute_psf_stats(psf, pixel_scale=0 * u.mas, metrics=("fwhm",))
+
+
 def test_public_metric_wrappers_return_expected_shapes_and_units() -> None:
     psf = _gaussian_psf(31, 31, 15.0, 15.0, 2.0, 2.5)
     psf /= psf.sum(dtype=np.float32)

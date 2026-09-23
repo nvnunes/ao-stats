@@ -87,10 +87,10 @@ class PsfMetadata:
 
 @dataclass(frozen=True)
 class _PreparedPsfMetadata:
-    wavelength: float | np.ndarray
+    wavelength: float | np.ndarray | None
     pixel_scale: float | np.ndarray
-    tel_diameter: float
-    tel_pupil: np.ndarray
+    tel_diameter: float | None
+    tel_pupil: np.ndarray | None
     has_per_psf_values: bool
 
 
@@ -190,6 +190,24 @@ def _prepare_psf_metadata(metadata: PsfMetadata, num_psfs: int) -> _PreparedPsfM
         tel_diameter=tel_diameter,
         tel_pupil=tel_pupil,
         has_per_psf_values=wavelength_is_per_psf or pixel_scale_is_per_psf,
+    )
+
+
+def _prepare_pixel_scale_metadata(
+    pixel_scale: u.Quantity, num_psfs: int
+) -> _PreparedPsfMetadata:
+    scale, per_psf = _prepare_shared_or_per_psf_positive_vector(
+        pixel_scale,
+        unit=u.mas,
+        label="pixel_scale",
+        num_psfs=num_psfs,
+    )
+    return _PreparedPsfMetadata(
+        wavelength=None,
+        pixel_scale=scale,
+        tel_diameter=None,
+        tel_pupil=None,
+        has_per_psf_values=per_psf,
     )
 
 
@@ -899,10 +917,10 @@ def _select_metadata_value(value: float | np.ndarray, index: int) -> float:
 def _compute_psf_stats_core(
     psf_cube: np.ndarray,
     *,
-    wavelength: float,
+    wavelength: float | None,
     pixel_scale: float,
-    tel_diameter: float,
-    tel_pupil: np.ndarray,
+    tel_diameter: float | None,
+    tel_pupil: np.ndarray | None,
     ee_apertures: np.ndarray,
     peak_method: str,
     fwhm_summary: str,
@@ -913,6 +931,8 @@ def _compute_psf_stats_core(
     peak_locations_yx = None
 
     if STATS_METRIC_SR in metrics:
+        if wavelength is None or tel_diameter is None or tel_pupil is None:
+            raise ValueError("Strehl requires PsfMetadata with full physical metadata.")
         sr, peak_locations_yx = _compute_strehl(
             psf_cube,
             peak_method,
@@ -972,8 +992,9 @@ def _format_metric_results(
 
 def compute_psf_stats(
     psfs: np.ndarray,
-    metadata: PsfMetadata,
+    metadata: PsfMetadata | None = None,
     *,
+    pixel_scale: u.Quantity | None = None,
     ee_apertures: u.Quantity | None = None,
     peak_method: str = DEFAULT_PEAK_METHOD,
     fwhm_summary: str = DEFAULT_FWHM_SUMMARY,
@@ -985,10 +1006,13 @@ def compute_psf_stats(
 
     Args:
         psfs: PSF image ``[Ny, Nx]`` or PSF cube ``[M, Ny, Nx]``.
-        metadata: Physical PSF metadata. ``wavelength`` and
-            ``pixel_scale`` may be scalar or one-dimensional per-PSF
-            vectors with length ``M``. ``tel_diameter`` and ``tel_pupil`` are
-            shared across the cube.
+        metadata: Full physical PSF metadata, required for Strehl. Omit only
+            when requesting EE and/or FWHM with ``pixel_scale`` instead.
+            ``wavelength`` and ``pixel_scale`` may be scalar or one-dimensional
+            per-PSF vectors with length ``M``. ``tel_diameter`` and ``tel_pupil``
+            are shared across the cube.
+        pixel_scale: Angular pixel scale when ``metadata`` is omitted. May be
+            scalar or a per-PSF vector. Cannot be combined with ``metadata``.
         ee_apertures: EE aperture diameters in milliarcseconds. Required
             when ``"ee"`` is selected. Pass a 1D vector ``[A]`` for shared
             apertures, or a 2D array ``[M, A]`` for per-PSF apertures.
@@ -1026,7 +1050,16 @@ def compute_psf_stats(
     psf_cube, scalar_output = _prepare_psf_cube(psfs)
     num_psfs = int(psf_cube.shape[0])
     metrics = _prepare_metrics(metrics)
-    metadata = _prepare_psf_metadata(metadata, num_psfs)
+    if metadata is None:
+        if STATS_METRIC_SR in metrics:
+            raise ValueError("Strehl requires PsfMetadata with full physical metadata.")
+        if pixel_scale is None:
+            raise ValueError("pixel_scale is required when metadata is omitted.")
+        prepared_metadata = _prepare_pixel_scale_metadata(pixel_scale, num_psfs)
+    else:
+        if pixel_scale is not None:
+            raise ValueError("Provide metadata or pixel_scale, not both.")
+        prepared_metadata = _prepare_psf_metadata(metadata, num_psfs)
     if STATS_METRIC_EE in metrics:
         if ee_apertures is None:
             raise ValueError("ee_apertures is required when computing EE.")
@@ -1042,13 +1075,17 @@ def compute_psf_stats(
     psf_cube = _apply_preprocess(psf_cube, preprocess)
     _validate_flux_inputs(psf_cube, metrics)
 
-    if not metadata.has_per_psf_values and not ee_apertures_are_per_psf:
+    if not prepared_metadata.has_per_psf_values and not ee_apertures_are_per_psf:
         results = _compute_psf_stats_core(
             psf_cube,
-            wavelength=float(metadata.wavelength),
-            pixel_scale=float(metadata.pixel_scale),
-            tel_diameter=metadata.tel_diameter,
-            tel_pupil=metadata.tel_pupil,
+            wavelength=(
+                float(prepared_metadata.wavelength)
+                if prepared_metadata.wavelength is not None
+                else None
+            ),
+            pixel_scale=float(prepared_metadata.pixel_scale),
+            tel_diameter=prepared_metadata.tel_diameter,
+            tel_pupil=prepared_metadata.tel_pupil,
             ee_apertures=ee_apertures,
             peak_method=peak_method,
             fwhm_summary=fwhm_summary,
@@ -1060,10 +1097,16 @@ def compute_psf_stats(
         for index in range(num_psfs):
             row_results = _compute_psf_stats_core(
                 psf_cube[index : index + 1],
-                wavelength=_select_metadata_value(metadata.wavelength, index),
-                pixel_scale=_select_metadata_value(metadata.pixel_scale, index),
-                tel_diameter=metadata.tel_diameter,
-                tel_pupil=metadata.tel_pupil,
+                wavelength=(
+                    _select_metadata_value(prepared_metadata.wavelength, index)
+                    if prepared_metadata.wavelength is not None
+                    else None
+                ),
+                pixel_scale=_select_metadata_value(
+                    prepared_metadata.pixel_scale, index
+                ),
+                tel_diameter=prepared_metadata.tel_diameter,
+                tel_pupil=prepared_metadata.tel_pupil,
                 ee_apertures=ee_apertures[index]
                 if ee_apertures_are_per_psf
                 else ee_apertures,
@@ -1119,9 +1162,10 @@ def compute_psf_sr(
 
 def compute_psf_ee(
     psfs: np.ndarray,
-    metadata: PsfMetadata,
+    metadata: PsfMetadata | None = None,
     *,
     ee_apertures: u.Quantity,
+    pixel_scale: u.Quantity | None = None,
     peak_method: str = DEFAULT_PEAK_METHOD,
     ee_geometry: str = DEFAULT_EE_GEOMETRY,
     preprocess: PsfPreprocessOption = "default",
@@ -1130,9 +1174,11 @@ def compute_psf_ee(
 
     Args:
         psfs: PSF image ``[Ny, Nx]`` or PSF cube ``[M, Ny, Nx]``.
-        metadata: Physical metadata for the PSFs.
+        metadata: Full physical metadata for the PSFs. Omit when supplying
+            ``pixel_scale`` without Strehl metadata.
         ee_apertures: Aperture-diameter quantity. Pass shape ``[A]`` for
             shared apertures or ``[M, A]`` for per-PSF apertures.
+        pixel_scale: Angular pixel scale used when ``metadata`` is omitted.
         peak_method: Peak estimator, ``"gaussian_fit"`` or ``"pixel_max"``.
         ee_geometry: Aperture geometry, ``"ensquared"`` or ``"encircled"``.
         preprocess: Preprocessing control accepted by ``compute_psf_stats``.
@@ -1150,6 +1196,7 @@ def compute_psf_ee(
     result = compute_psf_stats(
         psfs,
         metadata,
+        pixel_scale=pixel_scale,
         ee_apertures=ee_apertures,
         peak_method=peak_method,
         ee_geometry=ee_geometry,
@@ -1161,8 +1208,9 @@ def compute_psf_ee(
 
 def compute_psf_fwhm(
     psfs: np.ndarray,
-    metadata: PsfMetadata,
+    metadata: PsfMetadata | None = None,
     *,
+    pixel_scale: u.Quantity | None = None,
     fwhm_summary: str = DEFAULT_FWHM_SUMMARY,
     preprocess: PsfPreprocessOption = "default",
 ) -> StatValue:
@@ -1170,7 +1218,9 @@ def compute_psf_fwhm(
 
     Args:
         psfs: PSF image ``[Ny, Nx]`` or PSF cube ``[M, Ny, Nx]``.
-        metadata: Physical metadata for the PSFs.
+        metadata: Full physical metadata for the PSFs. Omit when supplying
+            ``pixel_scale`` without Strehl metadata.
+        pixel_scale: Angular pixel scale used when ``metadata`` is omitted.
         fwhm_summary: Contour summary, ``"geom"``, ``"mean"``, ``"min"``, or
             ``"max"``.
         preprocess: Optional preprocessing control accepted by
@@ -1190,6 +1240,7 @@ def compute_psf_fwhm(
     result = compute_psf_stats(
         psfs,
         metadata,
+        pixel_scale=pixel_scale,
         fwhm_summary=fwhm_summary,
         preprocess=preprocess,
         metrics=(STATS_METRIC_FWHM,),

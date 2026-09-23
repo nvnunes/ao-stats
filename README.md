@@ -5,10 +5,10 @@ functions (PSFs). It calculates Strehl ratio, encircled or ensquared energy,
 and full width at half maximum (FWHM) from a single PSF image or a cube of
 PSFs.
 
-The package combines NumPy image arrays with explicit Astropy quantities for
-wavelength, pixel scale, telescope diameter, pupil geometry, aperture size,
-and returned physical values. It can measure all three statistics together or
-compute only the requested subset.
+The package combines NumPy image arrays with explicit Astropy quantities.
+Strehl requires wavelength, pixel scale, telescope diameter, and pupil;
+enclosed energy and FWHM can be measured with pixel scale alone. It can
+measure all three statistics together or compute only the requested subset.
 
 AO Stats measures PSFs; it does not generate them or prescribe a simulation,
 instrument, dataset, persistence, or plotting workflow. This makes the same
