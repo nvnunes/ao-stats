@@ -328,13 +328,29 @@ def _gaussian2d(
 
 def _fit_gaussian_core(
     psf: np.ndarray,
-    nbox: int = 4,
     *,
     assume_centered: bool = False,
     assume_circular: bool = False,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Fit a core Gaussian and return parameters in pixel-center coordinates."""
-    patch, grid_x, grid_y = _extract_core_patch(psf, nbox)
+    """Fit a core Gaussian and return parameters in full-image coordinates.
+
+    Free-center fits use a 5x5 patch about the brightest pixel, shifted inward
+    at image edges and reduced only when an image axis is shorter than five.
+    Fixed-center fits retain the parity-aware optical-center patch.
+    """
+    if assume_centered:
+        patch, grid_x, grid_y = _extract_core_patch(psf, 4)
+        y_center, x_center = 0.5 * (np.asarray(psf.shape) - 1)
+    else:
+        y_center, x_center = np.unravel_index(np.argmax(psf), psf.shape)
+        height, width = min(5, psf.shape[0]), min(5, psf.shape[1])
+        y_start = min(max(y_center - 2, 0), psf.shape[0] - height)
+        x_start = min(max(x_center - 2, 0), psf.shape[1] - width)
+        patch = psf[y_start : y_start + height, x_start : x_start + width]
+        grid_x, grid_y = np.meshgrid(
+            np.arange(x_start, x_start + width) - x_center,
+            np.arange(y_start, y_start + height) - y_center,
+        )
     coords = np.vstack([grid_x.ravel(), grid_y.ravel()])
     values = patch.ravel()
 
@@ -375,9 +391,6 @@ def _fit_gaussian_core(
             ),
         )
 
-    ny, nx = psf.shape
-    x_center = 0.5 * (nx - 1)
-    y_center = 0.5 * (ny - 1)
     amplitude_fit, sigma_x_fit, sigma_y_fit, x0_fit, y0_fit, theta_fit = popt
     return (
         np.asarray(
@@ -434,7 +447,9 @@ def _get_diffraction_limited_psf(
     psf = np.clip(psf, 0.0, None)
     total = float(psf.sum(dtype=np.float64))
     if not np.isfinite(total) or total <= 0.0:
-        raise ValueError("The telescope pupil did not produce a positive reference PSF.")
+        raise ValueError(
+            "The telescope pupil did not produce a positive reference PSF."
+        )
     psf /= total
     return psf.astype(np.float32, copy=False)
 
@@ -464,9 +479,7 @@ def _compute_strehl_gaussian_fit(
         pixel_scale,
         center_in_one_pix=False,
     )
-    peak_amplitude_dl = float(
-        _fit_gaussian_core(psf_dl, assume_centered=True, assume_circular=True)[0][0]
-    )
+    peak_amplitude_dl = float(_fit_gaussian_core(psf_dl, assume_centered=False)[0][0])
     sr = peak_amplitude / peak_amplitude_dl
     return np.asarray(sr, dtype=np.float32), peak_locations_yx
 
@@ -1018,7 +1031,8 @@ def compute_psf_stats(
             apertures, or a 2D array ``[M, A]`` for per-PSF apertures.
         peak_method: Shared peak estimator used for Strehl amplitude and
             enclosed-energy anchoring. Select ``"gaussian_fit"`` or
-            ``"pixel_max"``.
+            ``"pixel_max"``. Gaussian fits use a 5x5 patch about the brightest
+            pixel, shifted inward at edges and reduced for smaller images.
         fwhm_summary: FWHM contour summary selector: ``"geom"``, ``"mean"``,
             ``"min"``, or ``"max"``.
         ee_geometry: EE aperture geometry. Defaults to ``"ensquared"`` to

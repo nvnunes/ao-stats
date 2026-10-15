@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 from astropy import units as u
@@ -512,6 +514,98 @@ def test_diffraction_limited_psf_has_unit_strehl_for_both_methods() -> None:
         assert actual.to_value(u.dimensionless_unscaled) == pytest.approx(
             1.0, rel=1e-4, abs=1e-4
         )
+
+
+@pytest.mark.parametrize("shape", [(40, 40), (41, 41), (40, 41), (41, 40)])
+@pytest.mark.parametrize("center", [(7.2, 30.3), (0.2, 38.8), (38.8, 0.2)])
+def test_gaussian_fit_recovers_displaced_peak(
+    shape: tuple[int, int], center: tuple[float, float]
+) -> None:
+    psf = _gaussian_psf(*shape, *center, 1.4, 1.8)
+
+    fit, _ = psf_module._fit_gaussian_core(psf.astype(float))
+
+    np.testing.assert_allclose(fit[[3, 4]], center, atol=1e-3)
+    assert fit[0] == pytest.approx(1.0, rel=1e-3)
+
+
+@pytest.mark.parametrize("shape", [(3, 4), (4, 3), (3, 3)])
+def test_gaussian_fit_supports_images_smaller_than_patch(
+    shape: tuple[int, int],
+) -> None:
+    psf = _gaussian_psf(*shape, 1.2, 1.3, 1.4, 1.8)
+
+    fit, _ = psf_module._fit_gaussian_core(psf.astype(float))
+
+    np.testing.assert_allclose(fit[[3, 4]], [1.2, 1.3], atol=1e-3)
+
+
+@pytest.mark.parametrize("shape", [(40, 40), (41, 41), (40, 41), (41, 40)])
+def test_fixed_center_gaussian_fit_retains_optical_center(
+    shape: tuple[int, int],
+) -> None:
+    center = 0.5 * (np.asarray(shape) - 1)
+    psf = _gaussian_psf(*shape, *center, 1.4, 1.8)
+
+    fit, _ = psf_module._fit_gaussian_core(psf.astype(float), assume_centered=True)
+
+    np.testing.assert_allclose(fit[[3, 4]], center, atol=1e-6)
+    assert fit[0] == pytest.approx(1.0, rel=1e-3)
+
+
+@pytest.mark.parametrize("geometry", ["ensquared", "encircled"])
+def test_gaussian_peak_measurements_are_translation_invariant(geometry: str) -> None:
+    psf = _gaussian_psf(48, 50, 23.2, 24.3, 1.4, 1.8)
+    psf *= 0.8 / psf.sum(dtype=np.float64)
+    shifted = np.roll(psf, (-10, 12), axis=(0, 1))
+    cube = np.stack((psf, shifted))
+    options = {
+        "ee_apertures": np.array([12.0, 24.0]) * u.mas,
+        "ee_geometry": geometry,
+        "preprocess": None,
+        "metrics": ("sr", "ee"),
+    }
+
+    sr, ee = compute_psf_stats(cube, _metadata(), **options)
+    single_sr, single_ee = compute_psf_stats(shifted, _metadata(), **options)
+
+    assert sr.shape == (2,)
+    assert ee.shape == (2, 2)
+    assert single_sr.isscalar
+    assert single_ee.shape == (2,)
+    assert sr.dtype == ee.dtype == np.float32
+    assert sr.unit == ee.unit == u.dimensionless_unscaled
+    np.testing.assert_allclose(sr.value, sr.value[0], rtol=1e-4)
+    np.testing.assert_allclose(ee.value[1], ee.value[0], atol=2e-6)
+    np.testing.assert_allclose(single_sr.value, sr.value[1], rtol=1e-6)
+    np.testing.assert_allclose(single_ee.value, ee.value[1], atol=2e-6)
+
+
+def test_displaced_native_psfs_have_consistent_ensquared_energy() -> None:
+    # Exact, unrenormalized float32 Specula PSFs from the 2026-10-13 native
+    # component comparison: science index 28, 50 warmup + 20 retained frames.
+    with np.load(
+        Path(__file__).parent / "data" / "displaced-peak-psfs.npz",
+        allow_pickle=False,
+    ) as data:
+        cube = np.stack([data[key] for key in ("baseline", "native_lgs", "native_fft")])
+    options = {
+        "pixel_scale": 11.637109077416333 * u.mas,
+        "ee_apertures": np.array([100.0]) * u.mas,
+        "preprocess": None,
+    }
+
+    ee = compute_psf_ee(cube, **options)
+    single_ee = compute_psf_ee(cube[0], **options)
+
+    assert cube.dtype == np.float32
+    np.testing.assert_allclose(
+        cube.sum(axis=(1, 2), dtype=np.float64), 0.891059, rtol=0, atol=1e-7
+    )
+    np.testing.assert_allclose(ee.value, 0.47576088, rtol=0, atol=2e-6)
+    np.testing.assert_allclose(ee.value, ee.value[0, 0], rtol=0, atol=3e-7)
+    assert single_ee.isscalar
+    np.testing.assert_allclose(single_ee.value, ee.value[0, 0], atol=1e-7)
 
 
 def test_enclosed_energy_geometries_preserve_expected_relationship() -> None:

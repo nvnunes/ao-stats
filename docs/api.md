@@ -87,6 +87,14 @@ Strehl cannot be requested through the pixel-scale-only path.
 | Enclosed energy geometry | `ensquared`, `encircled` | `ensquared` | dimensionless |
 | FWHM summary | `geom`, `mean`, `min`, `max` | `geom` | milliarcseconds |
 
+`gaussian_fit` locates the brightest pixel in each PSF and fits a Gaussian
+within a 5×5 patch around it, regardless of image parity. At an image edge,
+the patch shifts inward to keep its full size; axes shorter than five pixels
+use all available pixels. The fitted amplitude feeds Strehl and the fitted
+subpixel location centers enclosed-energy apertures. Strehl uses the same
+estimator for the diffraction-limited reference. `pixel_max` uses the brightest
+pixel's value and integer location directly.
+
 `ee_apertures` contains aperture diameters in angular units. Supply a
 one-dimensional array to use the same apertures for every PSF, or an `[M, A]`
 array to use `A` aperture sizes for each PSF in a cube.
