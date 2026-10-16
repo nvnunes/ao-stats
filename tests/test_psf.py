@@ -493,6 +493,68 @@ def test_unsupported_diffraction_sampling_is_rejected() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    ("pupil_size", "fft_size", "diameter", "wavelength"),
+    [(128, 256, 8.0, 1.65), (396, 1584, 9.655555555555557, 2.179)],
+)
+@pytest.mark.parametrize("per_psf_metadata", [False, True])
+def test_independent_diffraction_psf_has_unit_pixel_strehl(
+    pupil_size: int,
+    fft_size: int,
+    diameter: float,
+    wavelength: float,
+    per_psf_metadata: bool,
+) -> None:
+    axis = np.arange(pupil_size) - pupil_size // 2
+    x, y = np.meshgrid(axis, axis)
+    radius = np.hypot(x, y)
+    pupil = ((radius <= pupil_size / 4) & (radius >= pupil_size / 16)).astype(float)
+    # The expected PSF uses an explicit FFT size, independently of AO Stats'
+    # inference from rounded physical metadata. Its crop retains lost flux.
+    field = np.fft.fftshift(np.fft.fft2(pupil, s=(fft_size, fft_size)))
+    psf = np.abs(field) ** 2 / (fft_size**2 * np.sum(pupil**2))
+    start = fft_size // 2 - 32
+    psf = psf[start : start + 64, start : start + 64]
+    pixel_scale = (
+        wavelength * 1e-6 * pupil_size / (diameter * fft_size) * u.rad.to(u.mas)
+    )
+    metadata = _metadata(
+        wavelength=np.array([wavelength, wavelength]) if per_psf_metadata else wavelength,
+        pixel_scale=(
+            np.array([pixel_scale, pixel_scale]) if per_psf_metadata else pixel_scale
+        ),
+        tel_diameter=diameter,
+        tel_pupil=pupil,
+    )
+    cube = np.stack([psf, 0.4 * psf])
+    actual = compute_psf_sr(
+        cube, metadata, peak_method=PEAK_METHOD_PIXEL_MAX, preprocess=None
+    )
+    np.testing.assert_allclose(actual.value, [1.0, 0.4], rtol=1e-6, atol=0)
+    if not per_psf_metadata:
+        single = compute_psf_sr(
+            psf, metadata, peak_method=PEAK_METHOD_PIXEL_MAX, preprocess=None
+        )
+        assert single.shape == ()
+        assert single.value == pytest.approx(1.0, rel=1e-6)
+
+
+@pytest.mark.parametrize("padding", [3.01, 3.49, 3.51, 3.99])
+def test_diffraction_reference_keeps_fractional_padding_truncation(padding: float) -> None:
+    pupil = np.ones((10, 10))
+    wavelength = 1.65
+    sampling = 1.0 + 2.0 * padding / 10
+    pixel_scale = wavelength * 1e-6 / 8.0 / sampling * u.rad.to(u.mas)
+    reference = psf_module._get_diffraction_limited_psf(
+        8.0, pupil, wavelength, pixel_scale, center_in_one_pix=True
+    )
+    field = np.fft.fftshift(np.fft.fft2(np.pad(pupil, 3)))
+    expected = np.abs(field) ** 2
+    expected /= expected.sum()
+    assert reference.shape == (16, 16)
+    np.testing.assert_allclose(reference, expected, rtol=1e-6, atol=1e-8)
+
+
 def test_diffraction_limited_psf_has_unit_strehl_for_both_methods() -> None:
     pupil = np.ones((6, 6), dtype=np.float32)
     for method, center_in_one_pix in (

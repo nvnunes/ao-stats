@@ -95,6 +95,11 @@ subpixel location centers enclosed-energy apertures. Strehl uses the same
 estimator for the diffraction-limited reference. `pixel_max` uses the brightest
 pixel's value and integer location directly.
 
+Diffraction-reference pupil padding is snapped to an integer when the
+difference is within float32 metadata roundoff. Genuinely fractional padding
+is truncated toward zero. This preserves the intended Fourier grid when
+physical metadata describe an integer padding size.
+
 `ee_apertures` contains aperture diameters in angular units. Supply a
 one-dimensional array to use the same apertures for every PSF, or an `[M, A]`
 array to use `A` aperture sizes for each PSF in a cube.

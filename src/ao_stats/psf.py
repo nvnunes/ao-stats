@@ -408,6 +408,18 @@ def _fit_gaussian_core(
     )
 
 
+def _diffraction_padding(length: int, sampling: float) -> int:
+    """Truncate padding after correcting near-integer metadata roundoff."""
+    padding = (sampling - 1.0) * length / 2.0
+    nearest = round(padding)
+    # Sampling combines three float32 metadata values. Allow their roundoff
+    # with a margin, scaled by the half-size of the Fourier grid.
+    tolerance = 4 * np.finfo(np.float32).eps * max(1.0, sampling * length / 2.0)
+    if abs(padding - nearest) <= tolerance:
+        padding = nearest
+    return int(padding)
+
+
 def _get_diffraction_limited_psf(
     tel_diameter: float,
     tel_pupil: np.ndarray,
@@ -428,8 +440,8 @@ def _get_diffraction_limited_psf(
 
     pupil = np.abs(np.asarray(tel_pupil, dtype=float))
     nx, ny = pupil.shape
-    pad_x = int((sampling - 1.0) * nx / 2.0)
-    pad_y = int((sampling - 1.0) * ny / 2.0)
+    pad_x = _diffraction_padding(nx, sampling)
+    pad_y = _diffraction_padding(ny, sampling)
     pupil_pad = np.pad(pupil, [(pad_x, pad_x), (pad_y, pad_y)])
 
     field = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(pupil_pad)))
