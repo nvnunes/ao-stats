@@ -14,7 +14,7 @@ Every public calculation follows the same flow:
    caller's explicit preprocessing choice.
 4. Validate the prepared physical-flux contract required by selected metrics.
 5. Calculate only the requested Strehl, enclosed-energy, and FWHM values.
-6. Return `float32` Astropy quantities with shapes appropriate to a single PSF
+6. Return Astropy quantities at the selected precision with shapes appropriate to a single PSF
    or cube.
 
 The combined `compute_psf_stats` function shares validation, preprocessing,

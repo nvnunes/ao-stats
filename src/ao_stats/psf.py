@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from functools import partial
+
 import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
@@ -9,6 +11,7 @@ from typing import Any, Literal, TypeAlias
 
 import contourpy
 import numpy as np
+from numpy.typing import DTypeLike
 from astropy import units as u
 from photutils.profiles import CurveOfGrowth
 from scipy.interpolate import interp1d
@@ -85,6 +88,19 @@ class PsfMetadata:
 # Input validation and shaping
 
 
+def _real_dtype(dtype) -> np.dtype:
+    """Validate the two supported real calculation precisions."""
+    if dtype is None:
+        raise ValueError("dtype must be float32 or float64.")
+    try:
+        dtype = np.dtype(dtype)
+    except (TypeError, ValueError) as error:
+        raise ValueError("dtype must be float32 or float64.") from error
+    if dtype not in (np.dtype("float32"), np.dtype("float64")):
+        raise ValueError("dtype must be float32 or float64.")
+    return dtype
+
+
 @dataclass(frozen=True)
 class _PreparedPsfMetadata:
     wavelength: float | np.ndarray | None
@@ -94,9 +110,11 @@ class _PreparedPsfMetadata:
     has_per_psf_values: bool
 
 
-def _prepare_psf_cube(psfs: np.ndarray) -> tuple[np.ndarray, bool]:
-    """Validate a PSF image or cube and return a 3D float32 cube."""
-    psf_cube = np.asarray(psfs, dtype=np.float32)
+def _prepare_psf_cube(
+    psfs: np.ndarray, *, dtype: DTypeLike = np.float32
+) -> tuple[np.ndarray, bool]:
+    """Validate a PSF image or cube and return a 3D cube at the requested precision."""
+    psf_cube = np.asarray(psfs, dtype=dtype)
     scalar_output = False
     if psf_cube.ndim == 2:
         psf_cube = psf_cube[None, :, :]
@@ -121,10 +139,11 @@ def _prepare_shared_or_per_psf_positive_vector(
     unit: u.UnitBase,
     label: str,
     num_psfs: int,
+    dtype: DTypeLike = np.float32,
 ) -> tuple[float | np.ndarray, bool]:
-    values = quantity_value(value, unit, label=label, dtype=np.float32)
+    values = quantity_value(value, unit, label=label, dtype=dtype)
     if values.ndim == 0:
-        scalar = float(values)
+        scalar = np.asarray(values, dtype=dtype)[()]
         if not np.isfinite(scalar) or scalar <= 0.0:
             raise ValueError(f"{label} must be finite and > 0.")
         return scalar, False
@@ -136,10 +155,12 @@ def _prepare_shared_or_per_psf_positive_vector(
         )
     if not np.all(np.isfinite(values)) or np.any(values <= 0.0):
         raise ValueError(f"{label} must contain only finite values > 0.")
-    return values.astype(np.float32, copy=False), True
+    return values.astype(dtype, copy=False), True
 
 
-def _prepare_psf_metadata(metadata: PsfMetadata, num_psfs: int) -> _PreparedPsfMetadata:
+def _prepare_psf_metadata(
+    metadata: PsfMetadata, num_psfs: int, *, dtype: DTypeLike = np.float32
+) -> _PreparedPsfMetadata:
     if not isinstance(metadata, PsfMetadata):
         raise TypeError("metadata must be a PsfMetadata instance.")
 
@@ -148,20 +169,22 @@ def _prepare_psf_metadata(metadata: PsfMetadata, num_psfs: int) -> _PreparedPsfM
         unit=u.um,
         label="metadata.wavelength",
         num_psfs=num_psfs,
+        dtype=dtype,
     )
     pixel_scale, pixel_scale_is_per_psf = _prepare_shared_or_per_psf_positive_vector(
         metadata.pixel_scale,
         unit=u.mas,
         label="metadata.pixel_scale",
         num_psfs=num_psfs,
+        dtype=dtype,
     )
 
     tel_diameter = quantity_value(
-        metadata.tel_diameter, u.m, label="metadata.tel_diameter", dtype=np.float32
+        metadata.tel_diameter, u.m, label="metadata.tel_diameter", dtype=dtype
     )
     if tel_diameter.ndim != 0:
         raise ValueError("metadata.tel_diameter must be a scalar.")
-    tel_diameter = float(tel_diameter)
+    tel_diameter = np.asarray(tel_diameter, dtype=dtype)[()]
     if not np.isfinite(tel_diameter) or tel_diameter <= 0.0:
         raise ValueError("metadata.tel_diameter must be finite and > 0.")
 
@@ -169,7 +192,7 @@ def _prepare_psf_metadata(metadata: PsfMetadata, num_psfs: int) -> _PreparedPsfM
         metadata.tel_pupil,
         u.dimensionless_unscaled,
         label="metadata.tel_pupil",
-        dtype=np.float32,
+        dtype=dtype,
     )
     if tel_pupil.ndim != 2:
         raise ValueError("metadata.tel_pupil must be 2D [Ny, Nx].")
@@ -178,8 +201,8 @@ def _prepare_psf_metadata(metadata: PsfMetadata, num_psfs: int) -> _PreparedPsfM
     if not np.all(np.isfinite(tel_pupil)):
         raise ValueError("metadata.tel_pupil must contain only finite values.")
     pupil_power = np.sum(
-        np.abs(np.asarray(tel_pupil, dtype=np.float64)) ** 2,
-        dtype=np.float64,
+        np.abs(np.asarray(tel_pupil, dtype=dtype)) ** 2,
+        dtype=dtype,
     )
     if not np.isfinite(pupil_power) or pupil_power <= 0.0:
         raise ValueError("metadata.tel_pupil must have finite positive power.")
@@ -194,13 +217,17 @@ def _prepare_psf_metadata(metadata: PsfMetadata, num_psfs: int) -> _PreparedPsfM
 
 
 def _prepare_pixel_scale_metadata(
-    pixel_scale: u.Quantity, num_psfs: int
+    pixel_scale: u.Quantity,
+    num_psfs: int,
+    *,
+    dtype: DTypeLike = np.float32,
 ) -> _PreparedPsfMetadata:
     scale, per_psf = _prepare_shared_or_per_psf_positive_vector(
         pixel_scale,
         unit=u.mas,
         label="pixel_scale",
         num_psfs=num_psfs,
+        dtype=dtype,
     )
     return _PreparedPsfMetadata(
         wavelength=None,
@@ -211,10 +238,10 @@ def _prepare_pixel_scale_metadata(
     )
 
 
-def _prepare_ee_apertures(ee_apertures: Any, num_psfs: int) -> tuple[np.ndarray, bool]:
-    apertures = quantity_value(
-        ee_apertures, u.mas, label="ee_apertures", dtype=np.float32
-    )
+def _prepare_ee_apertures(
+    ee_apertures: Any, num_psfs: int, *, dtype: DTypeLike = np.float32
+) -> tuple[np.ndarray, bool]:
+    apertures = quantity_value(ee_apertures, u.mas, label="ee_apertures", dtype=dtype)
     if apertures.ndim == 1:
         if apertures.size == 0:
             raise ValueError("ee_apertures must be non-empty.")
@@ -271,7 +298,9 @@ def _prepare_metrics(metrics: Sequence[str] | None) -> tuple[str, ...]:
 # Strehl helpers
 
 
-def _axis_indices_and_coords(length: int, nbox: int) -> tuple[np.ndarray, np.ndarray]:
+def _axis_indices_and_coords(
+    length: int, nbox: int, *, dtype: DTypeLike = np.float32
+) -> tuple[np.ndarray, np.ndarray]:
     """Return centered patch indices and coordinates for one PSF axis."""
     nbox = min(int(nbox), int(length))
     if (length % 2) == 0:
@@ -292,15 +321,16 @@ def _axis_indices_and_coords(length: int, nbox: int) -> tuple[np.ndarray, np.nda
         stop = start + size
         idx = np.arange(start, stop, dtype=np.int64)
         coord = (idx - center) + 0.5
-    return idx, np.asarray(coord, dtype=float)
+    return idx, np.asarray(coord, dtype=dtype)
 
 
 def _extract_core_patch(
     psf: np.ndarray, nbox: int
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Extract a parity-aware core patch centered on the optical center."""
-    y_idx, y_coord = _axis_indices_and_coords(int(psf.shape[0]), nbox)
-    x_idx, x_coord = _axis_indices_and_coords(int(psf.shape[1]), nbox)
+    dtype = np.asarray(psf).dtype
+    y_idx, y_coord = _axis_indices_and_coords(int(psf.shape[0]), nbox, dtype=dtype)
+    x_idx, x_coord = _axis_indices_and_coords(int(psf.shape[1]), nbox, dtype=dtype)
     patch = psf[np.ix_(y_idx, x_idx)]
     grid_x, grid_y = np.meshgrid(x_coord, y_coord)
     return patch, grid_x, grid_y
@@ -314,9 +344,15 @@ def _gaussian2d(
     x0: float,
     y0: float,
     theta: float,
+    *,
+    dtype=None,
 ) -> np.ndarray:
     """Evaluate a rotated 2D Gaussian."""
-    x, y = coords
+    dtype = np.asarray(coords).dtype if dtype is None else np.dtype(dtype)
+    x, y = np.asarray(coords, dtype=dtype)
+    amplitude, sigma_x, sigma_y, x0, y0, theta = np.asarray(
+        [amplitude, sigma_x, sigma_y, x0, y0, theta], dtype=dtype
+    )
     xr = x - x0
     yr = y - y0
     cos_theta = np.cos(theta)
@@ -324,6 +360,23 @@ def _gaussian2d(
     x_rot = cos_theta * xr + sin_theta * yr
     y_rot = -sin_theta * xr + cos_theta * yr
     return amplitude * np.exp(-0.5 * ((x_rot / sigma_x) ** 2 + (y_rot / sigma_y) ** 2))
+
+
+def _gaussian_jacobian(coords, *parameters, dtype=None):
+    """Use resolved-precision absolute steps, including at zero-valued centres."""
+    dtype = np.asarray(coords).dtype if dtype is None else np.dtype(dtype)
+    coords = np.asarray(coords, dtype=dtype)
+    parameters = np.asarray(parameters, dtype=dtype)
+    steps = np.sqrt(np.finfo(dtype).eps) * np.maximum(1, np.abs(parameters))
+    columns = []
+    for index, step in enumerate(steps):
+        plus, minus = parameters.copy(), parameters.copy()
+        plus[index] += step
+        minus[index] -= step
+        columns.append(
+            (_gaussian2d(coords, *plus) - _gaussian2d(coords, *minus)) / (2 * step)
+        )
+    return np.column_stack(columns)
 
 
 def _fit_gaussian_core(
@@ -338,6 +391,7 @@ def _fit_gaussian_core(
     at image edges and reduced only when an image axis is shorter than five.
     Fixed-center fits retain the parity-aware optical-center patch.
     """
+    dtype = np.asarray(psf).dtype
     if assume_centered:
         patch, grid_x, grid_y = _extract_core_patch(psf, 4)
         y_center, x_center = 0.5 * (np.asarray(psf.shape) - 1)
@@ -351,7 +405,7 @@ def _fit_gaussian_core(
             np.arange(x_start, x_start + width) - x_center,
             np.arange(y_start, y_start + height) - y_center,
         )
-    coords = np.vstack([grid_x.ravel(), grid_y.ravel()])
+    coords = np.vstack([grid_x.ravel(), grid_y.ravel()]).astype(dtype)
     values = patch.ravel()
 
     amplitude0 = float(patch.max())
@@ -381,10 +435,13 @@ def _fit_gaussian_core(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", OptimizeWarning)
         popt, pcov = curve_fit(
-            _gaussian2d,
+            partial(_gaussian2d, dtype=dtype),
             coords,
             values,
             p0=p0,
+            jac=partial(_gaussian_jacobian, dtype=dtype)
+            if dtype == np.dtype("float32")
+            else None,
             bounds=(
                 [0.0, 0.1, 0.1, x_min, y_min, theta_min],
                 [np.inf, 100.0, 100.0, x_max, y_max, theta_max],
@@ -402,19 +459,21 @@ def _fit_gaussian_core(
                 x_center + x0_fit,
                 theta_fit,
             ],
-            dtype=float,
+            dtype=dtype,
         ),
-        np.asarray(pcov, dtype=float),
+        np.asarray(pcov, dtype=dtype),
     )
 
 
-def _diffraction_padding(length: int, sampling: float) -> int:
+def _diffraction_padding(
+    length: int, sampling: float, *, dtype: DTypeLike = np.float32
+) -> int:
     """Truncate padding after correcting near-integer metadata roundoff."""
     padding = (sampling - 1.0) * length / 2.0
     nearest = round(padding)
-    # Sampling combines three float32 metadata values. Allow their roundoff
+    # Sampling combines three metadata values. Allow their roundoff
     # with a margin, scaled by the half-size of the Fourier grid.
-    tolerance = 4 * np.finfo(np.float32).eps * max(1.0, sampling * length / 2.0)
+    tolerance = 4 * np.finfo(dtype).eps * max(1.0, sampling * length / 2.0)
     if abs(padding - nearest) <= tolerance:
         padding = nearest
     return int(padding)
@@ -429,19 +488,20 @@ def _get_diffraction_limited_psf(
     center_in_one_pix: bool,
 ) -> np.ndarray:
     """Compute the diffraction-limited PSF from the pupil."""
-    wavelength_m = float(wavelength) * 1e-6
+    dtype = np.asarray(tel_pupil).dtype
+    wavelength_m = dtype.type(wavelength) * 1e-6
     pixel_scale_rad = pixel_scale / 1000.0 / 3600.0 / 180.0 * np.pi
-    sampling = wavelength_m / float(tel_diameter) / pixel_scale_rad
+    sampling = wavelength_m / dtype.type(tel_diameter) / pixel_scale_rad
     if not np.isfinite(sampling) or sampling < 1.0:
         raise ValueError(
             "Diffraction-limited PSF sampling must be finite and >= 1 pixel "
             f"per wavelength/diameter, got {sampling:.6g}."
         )
 
-    pupil = np.abs(np.asarray(tel_pupil, dtype=float))
+    pupil = np.abs(np.asarray(tel_pupil, dtype=dtype))
     nx, ny = pupil.shape
-    pad_x = _diffraction_padding(nx, sampling)
-    pad_y = _diffraction_padding(ny, sampling)
+    pad_x = _diffraction_padding(nx, sampling, dtype=dtype)
+    pad_y = _diffraction_padding(ny, sampling, dtype=dtype)
     pupil_pad = np.pad(pupil, [(pad_x, pad_x), (pad_y, pad_y)])
 
     field = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(pupil_pad)))
@@ -449,21 +509,25 @@ def _get_diffraction_limited_psf(
 
     n_x, n_y = psf.shape
     if (n_x % 2) == 0 and not center_in_one_pix:
-        u_1d = np.fft.fftshift(np.fft.fftfreq(n_x))
-        v_1d = np.fft.fftshift(np.fft.fftfreq(n_y))
+        u_1d = np.fft.fftshift(np.fft.fftfreq(n_x).astype(dtype))
+        v_1d = np.fft.fftshift(np.fft.fftfreq(n_y).astype(dtype))
         u_2d, v_2d = np.meshgrid(u_1d, v_1d, indexing="ij")
         otf = np.fft.fftshift(np.fft.fft2(np.fft.ifftshift(psf)))
-        otf *= np.exp(1j * np.pi * (u_2d + v_2d))
+        otf *= np.exp(
+            (1j * np.pi * (u_2d + v_2d)).astype(
+                np.complex64 if dtype == np.dtype("float32") else np.complex128
+            )
+        )
         psf = np.real(np.fft.fftshift(np.fft.ifft2(np.fft.ifftshift(otf))))
 
     psf = np.clip(psf, 0.0, None)
-    total = float(psf.sum(dtype=np.float64))
+    total = float(psf.sum(dtype=dtype))
     if not np.isfinite(total) or total <= 0.0:
         raise ValueError(
             "The telescope pupil did not produce a positive reference PSF."
         )
     psf /= total
-    return psf.astype(np.float32, copy=False)
+    return psf.astype(dtype, copy=False)
 
 
 def _compute_strehl_gaussian_fit(
@@ -474,15 +538,16 @@ def _compute_strehl_gaussian_fit(
     tel_pupil: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute Strehl via fitted core amplitude."""
+    dtype = np.asarray(psfs).dtype
     peak_fits = np.asarray(
         [
-            _fit_gaussian_core(np.asarray(psf, dtype=float), assume_centered=False)[0]
-            for psf in np.asarray(psfs, dtype=float)
+            _fit_gaussian_core(np.asarray(psf, dtype=dtype), assume_centered=False)[0]
+            for psf in np.asarray(psfs, dtype=dtype)
         ],
-        dtype=float,
+        dtype=dtype,
     )
     peak_amplitude = peak_fits[:, 0]
-    peak_locations_yx = peak_fits[:, [3, 4]].astype(np.float32)
+    peak_locations_yx = peak_fits[:, [3, 4]].astype(dtype)
 
     psf_dl = _get_diffraction_limited_psf(
         tel_diameter,
@@ -493,7 +558,7 @@ def _compute_strehl_gaussian_fit(
     )
     peak_amplitude_dl = float(_fit_gaussian_core(psf_dl, assume_centered=False)[0][0])
     sr = peak_amplitude / peak_amplitude_dl
-    return np.asarray(sr, dtype=np.float32), peak_locations_yx
+    return np.asarray(sr, dtype=dtype), peak_locations_yx
 
 
 def _compute_strehl_pixel_max(
@@ -504,12 +569,13 @@ def _compute_strehl_pixel_max(
     tel_pupil: np.ndarray,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Compute Strehl via native peak pixel."""
-    psfs = np.asarray(psfs, dtype=np.float32)
+    dtype = np.asarray(psfs).dtype
+    psfs = np.asarray(psfs, dtype=dtype)
     num_sci = int(psfs.shape[0])
     peak_idx = np.argmax(psfs.reshape(num_sci, -1), axis=1)
     peak_amplitude = psfs.reshape(num_sci, -1)[np.arange(num_sci), peak_idx]
     peak_y, peak_x = np.unravel_index(peak_idx, psfs.shape[1:])
-    peak_locations_yx = np.stack((peak_y, peak_x), axis=1).astype(np.float32)
+    peak_locations_yx = np.stack((peak_y, peak_x), axis=1).astype(dtype)
 
     psf_dl = _get_diffraction_limited_psf(
         tel_diameter,
@@ -520,7 +586,7 @@ def _compute_strehl_pixel_max(
     )
     peak_amplitude_dl = float(psf_dl.max())
     sr = peak_amplitude / peak_amplitude_dl
-    return np.asarray(sr, dtype=np.float32), peak_locations_yx
+    return np.asarray(sr, dtype=dtype), peak_locations_yx
 
 
 def _compute_strehl(
@@ -545,23 +611,24 @@ def _compute_strehl(
 
 def _compute_peak_locations(psfs: np.ndarray, peak_method: str) -> np.ndarray:
     """Return the peak-anchor locations used by the selected SR method."""
-    psfs = np.asarray(psfs, dtype=np.float32)
+    dtype = np.asarray(psfs).dtype
+    psfs = np.asarray(psfs, dtype=dtype)
     num_sci = int(psfs.shape[0])
     if peak_method == PEAK_METHOD_GAUSSIAN_FIT:
         peak_fits = np.asarray(
             [
-                _fit_gaussian_core(np.asarray(psf, dtype=float), assume_centered=False)[
+                _fit_gaussian_core(np.asarray(psf, dtype=dtype), assume_centered=False)[
                     0
                 ]
-                for psf in np.asarray(psfs, dtype=float)
+                for psf in np.asarray(psfs, dtype=dtype)
             ],
-            dtype=float,
+            dtype=dtype,
         )
-        return peak_fits[:, [3, 4]].astype(np.float32)
+        return peak_fits[:, [3, 4]].astype(dtype)
     if peak_method == PEAK_METHOD_PIXEL_MAX:
         peak_idx = np.argmax(psfs.reshape(num_sci, -1), axis=1)
         peak_y, peak_x = np.unravel_index(peak_idx, psfs.shape[1:])
-        return np.stack((peak_y, peak_x), axis=1).astype(np.float32)
+        return np.stack((peak_y, peak_x), axis=1).astype(dtype)
     raise ValueError(f"Unsupported peak method: {peak_method}")
 
 
@@ -573,7 +640,8 @@ def _anchor_psfs_for_ee(
     peak_locations_yx: np.ndarray | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Return PSFs plus integer peak anchors for enclosed energy."""
-    psfs = np.asarray(psfs, dtype=np.float32)
+    dtype = np.asarray(psfs).dtype
+    psfs = np.asarray(psfs, dtype=dtype)
     num_sci, _ny, nx = psfs.shape
 
     if peak_locations_yx is not None:
@@ -615,12 +683,13 @@ def _measure_peak_centered_ensquared_energy_curves(
     pixel_scale: float,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Measure cumulative odd-sized square-box EE curves about integer anchors."""
+    dtype = np.asarray(psfs).dtype
     num_sci = psfs.shape[0]
     radii = np.arange(max_radius + 1, dtype=np.int64)
     ee_curves = np.zeros((num_sci, radii.size), dtype=psfs.dtype)
     idx = np.arange(num_sci, dtype=np.int64)
     unique_radii = (
-        np.arange(1, ee_curves.shape[1] * 2, 2, dtype=float) * pixel_scale * 0.5
+        np.arange(1, ee_curves.shape[1] * 2, 2, dtype=dtype) * pixel_scale * 0.5
     )
 
     integral = np.pad(
@@ -657,18 +726,19 @@ def _measure_peak_centered_encircled_energy_cog(
     pixel_scale: float,
 ) -> np.ndarray:
     """Measure circular-aperture EE using Photutils curve-of-growth apertures."""
-    radii_pix = np.asarray(ee_radii, dtype=float) / float(pixel_scale)
+    dtype = np.asarray(psfs).dtype
+    radii_pix = np.asarray(ee_radii, dtype=dtype) / float(pixel_scale)
     if np.any(radii_pix <= 0.0):
         raise ValueError("Encircled EE apertures must have positive radii.")
     cog_radii_pix = radii_pix
     if radii_pix.size == 1:
-        cog_radii_pix = np.array([radii_pix[0], radii_pix[0] + 1.0], dtype=float)
-    ee = np.empty((psfs.shape[0], radii_pix.size), dtype=np.float32)
+        cog_radii_pix = np.array([radii_pix[0], radii_pix[0] + 1.0], dtype=dtype)
+    ee = np.empty((psfs.shape[0], radii_pix.size), dtype=dtype)
     for i, psf in enumerate(psfs):
         curve = CurveOfGrowth(
             psf, (float(peak_x[i]), float(peak_y[i])), cog_radii_pix, method="exact"
         )
-        ee[i, :] = np.asarray(curve.profile[: radii_pix.size], dtype=np.float32)
+        ee[i, :] = np.asarray(curve.profile[: radii_pix.size], dtype=dtype)
     return ee
 
 
@@ -678,11 +748,12 @@ def _interpolate_ee_at_radii(
     ee_radii: np.ndarray,
 ) -> np.ndarray:
     """Interpolate cumulative EE curves onto requested physical radii."""
-    curve_radii_mas = np.asarray(curve_radii_mas, dtype=float)
-    ee_at_radius = np.empty((ee_curves.shape[0], ee_radii.size), dtype=float)
+    dtype = np.asarray(ee_curves).dtype
+    curve_radii_mas = np.asarray(curve_radii_mas, dtype=dtype)
+    ee_at_radius = np.empty((ee_curves.shape[0], ee_radii.size), dtype=dtype)
     for i, values in enumerate(ee_curves):
         if curve_radii_mas.size == 1:
-            interpolated = np.full(ee_radii.shape, float(values[0]), dtype=float)
+            interpolated = np.full(ee_radii.shape, float(values[0]), dtype=dtype)
         else:
             interp_kind = "cubic" if curve_radii_mas.size >= 4 else "linear"
             interpolated = interp1d(
@@ -713,8 +784,9 @@ def _compute_enclosed_energy(
     ee_geometry: str = EE_GEOMETRY_ENSQUARED,
 ) -> np.ndarray:
     """Compute EE for the requested aperture geometry."""
+    dtype = np.asarray(psfs).dtype
     ee_geometry = _normalize_ee_geometry(ee_geometry)
-    ee_apertures = np.asarray(ee_apertures, dtype=float)
+    ee_apertures = np.asarray(ee_apertures, dtype=dtype)
     ee_radii = ee_apertures / 2.0
 
     psfs, peak_y, peak_x = _anchor_psfs_for_ee(psfs, peak_locations_yx)
@@ -756,7 +828,7 @@ def _compute_enclosed_energy(
             pixel_scale,
         )
 
-    return np.asarray(ee_at_radius, dtype=np.float32)
+    return np.asarray(ee_at_radius, dtype=dtype)
 
 
 # FWHM helpers
@@ -764,18 +836,20 @@ def _compute_enclosed_energy(
 
 def _find_contours(psf: np.ndarray, level: float) -> list[np.ndarray]:
     """Return contour vertices in `[N, 2]` arrays with `(x, y)` columns."""
-    generator = contourpy.contour_generator(z=np.asarray(psf, dtype=float))
-    return [np.asarray(line, dtype=float) for line in generator.lines(float(level))]
+    dtype = np.asarray(psf).dtype
+    generator = contourpy.contour_generator(z=psf)
+    return [np.asarray(line, dtype=dtype) for line in generator.lines(float(level))]
 
 
 def _measure_contour_fwhms(
     psfs: np.ndarray, pixel_scale: float
 ) -> tuple[np.ndarray, np.ndarray]:
     """Measure contour-derived minimum and maximum FWHM vectors."""
-    psfs = np.asarray(psfs, dtype=np.float32)
+    dtype = np.asarray(psfs).dtype
+    psfs = np.asarray(psfs, dtype=dtype)
     num_sci, ny, nx = psfs.shape
-    fwhm_min = np.full((num_sci,), np.nan, dtype=np.float32)
-    fwhm_max = np.full((num_sci,), np.nan, dtype=np.float32)
+    fwhm_min = np.full((num_sci,), np.nan, dtype=dtype)
+    fwhm_max = np.full((num_sci,), np.nan, dtype=dtype)
     edge_eps = 1e-6
 
     for i, psf in enumerate(psfs):
@@ -825,7 +899,7 @@ def _measure_contour_fwhms(
                 x_coords.max() + x_coords.min(),
                 y_coords.max() + y_coords.min(),
             ],
-            dtype=float,
+            dtype=dtype,
         )
         radial_distances = (
             np.hypot(
@@ -840,8 +914,8 @@ def _measure_contour_fwhms(
         if radial_max <= 0.0 or radial_min <= 0.0:
             continue
 
-        fwhm_max[i] = np.float32(2.0 * radial_max)
-        fwhm_min[i] = np.float32(2.0 * radial_min)
+        fwhm_max[i] = dtype.type(2.0 * radial_max)
+        fwhm_min[i] = dtype.type(2.0 * radial_min)
 
     return fwhm_min, fwhm_max
 
@@ -850,8 +924,9 @@ def _compute_fwhm_summary(
     fwhm_summary: str, fwhm_min: np.ndarray, fwhm_max: np.ndarray
 ) -> np.ndarray:
     """Select one FWHM summary vector from contour-derived minimum/maximum widths."""
+    dtype = np.asarray(fwhm_min).dtype
     if fwhm_summary == STATS_FWHM_SUMMARY_GEOM:
-        return np.sqrt(fwhm_max * fwhm_min, dtype=np.float32)
+        return np.sqrt(fwhm_max * fwhm_min, dtype=dtype)
     if fwhm_summary == STATS_FWHM_SUMMARY_MEAN:
         return 0.5 * (fwhm_max + fwhm_min)
     if fwhm_summary == STATS_FWHM_SUMMARY_MAX:
@@ -864,21 +939,25 @@ def _compute_fwhm_summary(
 # Public entrypoints
 
 
-def clip_and_sum_normalize_psfs(psfs: np.ndarray) -> np.ndarray:
+def clip_and_sum_normalize_psfs(
+    psfs: np.ndarray, *, dtype: DTypeLike = np.float32
+) -> np.ndarray:
     """Clip negative PSF pixels and normalize each positive-flux PSF.
 
     Negative pixels are clipped to zero. Each PSF with positive total pixel
     flux is then divided by its pixel sum.
 
     Args:
+        dtype: Real calculation/output precision, float32 (default) or float64.
         psfs: PSF image ``[Ny, Nx]`` or PSF cube ``[M, Ny, Nx]``.
 
     Returns:
-        A `float32` array with the same shape as ``psfs``. A PSF with no
+        An array at the requested precision with the same shape as ``psfs``. A PSF with no
         positive flux remains zero.
     """
-    psf_cube = np.maximum(np.asarray(psfs, dtype=np.float32), 0.0)
-    denom = np.sum(psf_cube, axis=(-2, -1), dtype=np.float32)
+    dtype = _real_dtype(dtype)
+    psf_cube = np.maximum(np.asarray(psfs, dtype=dtype), 0.0)
+    denom = np.sum(psf_cube, axis=(-2, -1), dtype=dtype)
     positive = denom > 0.0
     if np.any(positive):
         psf_cube = psf_cube.copy()
@@ -897,10 +976,13 @@ def _resolve_preprocess(preprocess: PsfPreprocessOption) -> PsfPreprocessor | No
 def _apply_preprocess(
     psf_cube: np.ndarray, preprocess: PsfPreprocessOption
 ) -> np.ndarray:
+    dtype = np.asarray(psf_cube).dtype
+    if isinstance(preprocess, str) and preprocess == "default":
+        return clip_and_sum_normalize_psfs(psf_cube, dtype=dtype)
     preprocess = _resolve_preprocess(preprocess)
     if preprocess is None:
         return psf_cube
-    prepared = np.asarray(preprocess(psf_cube), dtype=np.float32)
+    prepared = np.asarray(preprocess(psf_cube), dtype=dtype)
     if prepared.shape != psf_cube.shape:
         raise ValueError(
             f"preprocess must return a PSF cube with shape {psf_cube.shape}, got {prepared.shape}"
@@ -912,6 +994,7 @@ def _apply_preprocess(
 
 def _validate_flux_inputs(psf_cube: np.ndarray, metrics: tuple[str, ...]) -> None:
     """Validate prepared PSFs used by flux-dependent measurements."""
+    dtype = np.asarray(psf_cube).dtype
     if not ({STATS_METRIC_SR, STATS_METRIC_EE} & set(metrics)):
         return
     if np.any(psf_cube < 0.0):
@@ -919,7 +1002,7 @@ def _validate_flux_inputs(psf_cube: np.ndarray, metrics: tuple[str, ...]) -> Non
             "Prepared PSFs must be nonnegative when computing Strehl or "
             "enclosed energy."
         )
-    total_flux = np.sum(psf_cube, axis=(-2, -1), dtype=np.float64)
+    total_flux = np.sum(psf_cube, axis=(-2, -1), dtype=dtype)
     if np.any(total_flux <= 0.0):
         raise ValueError(
             "Prepared PSFs must have positive in-frame flux when computing "
@@ -935,8 +1018,8 @@ def _validate_flux_inputs(psf_cube: np.ndarray, metrics: tuple[str, ...]) -> Non
 
 def _select_metadata_value(value: float | np.ndarray, index: int) -> float:
     if isinstance(value, np.ndarray):
-        return float(value[index])
-    return float(value)
+        return value[index]
+    return np.asarray(value)[()]
 
 
 def _compute_psf_stats_core(
@@ -952,6 +1035,7 @@ def _compute_psf_stats_core(
     ee_geometry: str,
     metrics: tuple[str, ...],
 ) -> dict[str, np.ndarray]:
+    dtype = np.asarray(psf_cube).dtype
     output: dict[str, np.ndarray] = {}
     peak_locations_yx = None
 
@@ -966,7 +1050,7 @@ def _compute_psf_stats_core(
             tel_diameter,
             tel_pupil,
         )
-        output[STATS_METRIC_SR] = np.asarray(sr, dtype=np.float32)
+        output[STATS_METRIC_SR] = np.asarray(sr, dtype=dtype)
     elif STATS_METRIC_EE in metrics:
         peak_locations_yx = _compute_peak_locations(psf_cube, peak_method)
 
@@ -979,14 +1063,14 @@ def _compute_psf_stats_core(
                 peak_locations_yx,
                 ee_geometry=ee_geometry,
             ),
-            dtype=np.float32,
+            dtype=dtype,
         )
 
     if STATS_METRIC_FWHM in metrics:
         fwhm_min, fwhm_max = _measure_contour_fwhms(psf_cube, pixel_scale)
         output[STATS_METRIC_FWHM] = np.asarray(
             _compute_fwhm_summary(fwhm_summary, fwhm_min, fwhm_max),
-            dtype=np.float32,
+            dtype=dtype,
         )
 
     return output
@@ -1001,9 +1085,9 @@ def _format_metric_value(
     if name == STATS_METRIC_EE:
         ee_value = value[0].copy()
         if ee_value.shape[0] == 1:
-            return float(ee_value[0]) * unit
+            return u.Quantity(ee_value[0], unit, dtype=value.dtype)
         return ee_value * unit
-    return float(value[0]) * unit
+    return u.Quantity(value[0], unit, dtype=value.dtype)
 
 
 def _format_metric_results(
@@ -1026,10 +1110,12 @@ def compute_psf_stats(
     ee_geometry: str = DEFAULT_EE_GEOMETRY,
     preprocess: PsfPreprocessOption = "default",
     metrics: Sequence[str] | None = None,
+    dtype: DTypeLike = np.float32,
 ) -> tuple[StatValue, ...]:
     """Compute core PSF statistics for one PSF image or cube.
 
     Args:
+        dtype: Real calculation/output precision, float32 (default) or float64.
         psfs: PSF image ``[Ny, Nx]`` or PSF cube ``[M, Ny, Nx]``.
         metadata: Full physical PSF metadata, required for Strehl. Omit only
             when requesting EE and/or FWHM with ``pixel_scale`` instead.
@@ -1073,7 +1159,8 @@ def compute_psf_stats(
         ValueError: If PSF shapes or values, metadata values, apertures,
             selectors, or preprocessing results are invalid.
     """
-    psf_cube, scalar_output = _prepare_psf_cube(psfs)
+    dtype = _real_dtype(dtype)
+    psf_cube, scalar_output = _prepare_psf_cube(psfs, dtype=dtype)
     num_psfs = int(psf_cube.shape[0])
     metrics = _prepare_metrics(metrics)
     if metadata is None:
@@ -1081,19 +1168,21 @@ def compute_psf_stats(
             raise ValueError("Strehl requires PsfMetadata with full physical metadata.")
         if pixel_scale is None:
             raise ValueError("pixel_scale is required when metadata is omitted.")
-        prepared_metadata = _prepare_pixel_scale_metadata(pixel_scale, num_psfs)
+        prepared_metadata = _prepare_pixel_scale_metadata(
+            pixel_scale, num_psfs, dtype=dtype
+        )
     else:
         if pixel_scale is not None:
             raise ValueError("Provide metadata or pixel_scale, not both.")
-        prepared_metadata = _prepare_psf_metadata(metadata, num_psfs)
+        prepared_metadata = _prepare_psf_metadata(metadata, num_psfs, dtype=dtype)
     if STATS_METRIC_EE in metrics:
         if ee_apertures is None:
             raise ValueError("ee_apertures is required when computing EE.")
         ee_apertures, ee_apertures_are_per_psf = _prepare_ee_apertures(
-            ee_apertures, num_psfs
+            ee_apertures, num_psfs, dtype=dtype
         )
     else:
-        ee_apertures = np.empty((0,), dtype=np.float32)
+        ee_apertures = np.empty((0,), dtype=dtype)
         ee_apertures_are_per_psf = False
     peak_method = _require_peak_method(peak_method)
     fwhm_summary = _require_fwhm_summary(fwhm_summary)
@@ -1105,11 +1194,11 @@ def compute_psf_stats(
         results = _compute_psf_stats_core(
             psf_cube,
             wavelength=(
-                float(prepared_metadata.wavelength)
+                dtype.type(prepared_metadata.wavelength)
                 if prepared_metadata.wavelength is not None
                 else None
             ),
-            pixel_scale=float(prepared_metadata.pixel_scale),
+            pixel_scale=dtype.type(prepared_metadata.pixel_scale),
             tel_diameter=prepared_metadata.tel_diameter,
             tel_pupil=prepared_metadata.tel_pupil,
             ee_apertures=ee_apertures,
@@ -1144,7 +1233,7 @@ def compute_psf_stats(
             for name in metrics:
                 result_rows[name].append(row_results[name])
         results = {
-            name: np.concatenate(rows, axis=0).astype(np.float32, copy=False)
+            name: np.concatenate(rows, axis=0).astype(dtype, copy=False)
             for name, rows in result_rows.items()
         }
 
@@ -1157,10 +1246,12 @@ def compute_psf_sr(
     *,
     peak_method: str = DEFAULT_PEAK_METHOD,
     preprocess: PsfPreprocessOption = "default",
+    dtype: DTypeLike = np.float32,
 ) -> StatValue:
     """Measure PSF Strehl ratio.
 
     Args:
+        dtype: Real calculation/output precision, float32 (default) or float64.
         psfs: PSF image ``[Ny, Nx]`` or PSF cube ``[M, Ny, Nx]``.
         metadata: Physical metadata for the PSFs.
         peak_method: Peak estimator, ``"gaussian_fit"`` or ``"pixel_max"``.
@@ -1176,11 +1267,13 @@ def compute_psf_sr(
         ValueError: If PSFs, metadata, the selector, or preprocessing results
             are invalid.
     """
+    dtype = _real_dtype(dtype)
     result = compute_psf_stats(
         psfs,
         metadata,
         peak_method=peak_method,
         preprocess=preprocess,
+        dtype=dtype,
         metrics=(STATS_METRIC_SR,),
     )
     return result[0]
@@ -1195,10 +1288,12 @@ def compute_psf_ee(
     peak_method: str = DEFAULT_PEAK_METHOD,
     ee_geometry: str = DEFAULT_EE_GEOMETRY,
     preprocess: PsfPreprocessOption = "default",
+    dtype: DTypeLike = np.float32,
 ) -> StatValue:
     """Measure PSF enclosed energy.
 
     Args:
+        dtype: Real calculation/output precision, float32 (default) or float64.
         psfs: PSF image ``[Ny, Nx]`` or PSF cube ``[M, Ny, Nx]``.
         metadata: Full physical metadata for the PSFs. Omit when supplying
             ``pixel_scale`` without Strehl metadata.
@@ -1219,6 +1314,7 @@ def compute_psf_ee(
         ValueError: If PSFs, metadata, apertures, selectors, or preprocessing
             results are invalid.
     """
+    dtype = _real_dtype(dtype)
     result = compute_psf_stats(
         psfs,
         metadata,
@@ -1227,6 +1323,7 @@ def compute_psf_ee(
         peak_method=peak_method,
         ee_geometry=ee_geometry,
         preprocess=preprocess,
+        dtype=dtype,
         metrics=(STATS_METRIC_EE,),
     )
     return result[0]
@@ -1239,10 +1336,12 @@ def compute_psf_fwhm(
     pixel_scale: u.Quantity | None = None,
     fwhm_summary: str = DEFAULT_FWHM_SUMMARY,
     preprocess: PsfPreprocessOption = "default",
+    dtype: DTypeLike = np.float32,
 ) -> StatValue:
     """Measure contour-derived PSF FWHM.
 
     Args:
+        dtype: Real calculation/output precision, float32 (default) or float64.
         psfs: PSF image ``[Ny, Nx]`` or PSF cube ``[M, Ny, Nx]``.
         metadata: Full physical metadata for the PSFs. Omit when supplying
             ``pixel_scale`` without Strehl metadata.
@@ -1263,12 +1362,14 @@ def compute_psf_fwhm(
         ValueError: If PSFs, metadata, the selector, or preprocessing results
             are invalid.
     """
+    dtype = _real_dtype(dtype)
     result = compute_psf_stats(
         psfs,
         metadata,
         pixel_scale=pixel_scale,
         fwhm_summary=fwhm_summary,
         preprocess=preprocess,
+        dtype=dtype,
         metrics=(STATS_METRIC_FWHM,),
     )
     return result[0]

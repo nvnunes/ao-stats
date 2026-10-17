@@ -41,5 +41,7 @@ def quantity_value(
     dtype: Any | None = None,
 ) -> np.ndarray:
     """Return the unit-normalized numerical view of one required quantity."""
+    if dtype is not None and isinstance(value, u.Quantity):
+        value = value.astype(dtype)
     quantity = _require_quantity(value, unit, label=label)
     return np.asarray(quantity.value, dtype=dtype)

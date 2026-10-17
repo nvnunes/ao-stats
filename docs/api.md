@@ -96,7 +96,7 @@ estimator for the diffraction-limited reference. `pixel_max` uses the brightest
 pixel's value and integer location directly.
 
 Diffraction-reference pupil padding is snapped to an integer when the
-difference is within float32 metadata roundoff. Genuinely fractional padding
+difference is within metadata roundoff at the selected precision. Genuinely fractional padding
 is truncated toward zero. This preserves the intended Fourier grid when
 physical metadata describe an integer padding size.
 
@@ -128,3 +128,14 @@ multiple apertures.
 
 See the [Python reference](reference/api.md) for complete signatures, public
 types and selector constants, validation behavior, and function docstrings.
+
+## Numerical Precision
+
+Preprocessing and all measurement functions accept keyword-only `dtype`, either
+`np.float32` (default) or `np.float64`. NumPy dtype and string spellings are
+also accepted; other types raise `ValueError`. The choice applies to images,
+physical metadata preparation, reductions and returned quantities, including
+scalars. Custom preprocessing receives images in that dtype, and its validated
+return is converted back to it. SciPy solvers and interpolation, Photutils
+aperture integration and ContourPy contour extraction may use their own
+internal precision; results are converted at those boundaries.
