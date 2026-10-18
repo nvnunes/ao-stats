@@ -85,6 +85,8 @@ Strehl cannot be requested through the pixel-scale-only path.
 | Shared peak estimator | `gaussian_fit`, `pixel_max` | `gaussian_fit` | — |
 | Strehl ratio | Uses the shared peak estimator | — | dimensionless |
 | Enclosed energy geometry | `ensquared`, `encircled` | `ensquared` | dimensionless |
+| FWHM method | `contour`, `fourier_contour` | `contour` | milliarcseconds |
+| FWHM refinement factor | Positive integer | `4` | — |
 | FWHM summary | `geom`, `mean`, `min`, `max` | `geom` | milliarcseconds |
 
 `gaussian_fit` locates the brightest pixel in each PSF and fits a Gaussian
@@ -103,6 +105,41 @@ physical metadata describe an integer padding size.
 `ee_apertures` contains aperture diameters in angular units. Supply a
 one-dimensional array to use the same apertures for every PSF, or an `[M, A]`
 array to use `A` aperture sizes for each PSF in a cube.
+
+### FWHM Sampling
+
+`fwhm_method="contour"` measures the half-maximum contour at native sampling.
+Select `"fourier_contour"` to interpolate the intensity image before measuring
+the same contour geometry. Both `compute_psf_fwhm` and `compute_psf_stats`
+accept `fwhm_method` and `fwhm_refinement_factor`:
+
+```python
+from ao_stats import compute_psf_fwhm
+
+fwhm = compute_psf_fwhm(
+    psf,
+    pixel_scale=4.0 * u.mas,
+    fwhm_method="fourier_contour",
+    fwhm_refinement_factor=4,
+)
+```
+
+The multiplier defaults to 4; one gives the exact native measurement. It must
+be a positive integer, including when unused by `"contour"`; booleans and
+floating-point values are rejected. FWHM options are validated even when
+another metric subset is requested.
+
+Fourier interpolation zero-pads each axis by half its native length on each
+side, rounded up, then resamples each axis by the selected multiplier. Widths
+use the original pixel scale divided by that multiplier. Interpolation does
+not clip negative undershoots or repeat preprocessing. Contours must be valid
+on the native image and remain within its original extent after refinement;
+otherwise FWHM is `NaN`. Padding cannot recover a truncated PSF.
+
+Refinement changes only FWHM. It leaves Strehl, enclosed energy and
+`fwhm_summary` semantics unchanged. Cube inputs are refined one image at a
+time. Interpolation reduces sampling error for sufficiently sampled, smooth
+PSFs; it does not recover information lost to undersampling or suppress noise.
 
 ## Preprocessing
 

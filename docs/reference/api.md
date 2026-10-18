@@ -43,6 +43,11 @@ The supported API is imported from the `ao_stats` package root.
 
 | Name | Value |
 | --- | --- |
+| `STATS_FWHM_METHOD_CONTOUR` | `"contour"` |
+| `STATS_FWHM_METHOD_FOURIER_CONTOUR` | `"fourier_contour"` |
+| `STATS_FWHM_METHODS` | `("contour", "fourier_contour")` |
+| `DEFAULT_FWHM_METHOD` | `"contour"` |
+| `DEFAULT_FWHM_REFINEMENT_FACTOR` | `4` |
 | `STATS_FWHM_SUMMARY_GEOM` | `"geom"` |
 | `STATS_FWHM_SUMMARY_MEAN` | `"mean"` |
 | `STATS_FWHM_SUMMARY_MAX` | `"max"` |

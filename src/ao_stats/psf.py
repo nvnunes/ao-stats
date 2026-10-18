@@ -2,21 +2,21 @@
 
 from __future__ import annotations
 
-from functools import partial
-
 import warnings
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Literal, TypeAlias
 
 import contourpy
 import numpy as np
-from numpy.typing import DTypeLike
 from astropy import units as u
+from numpy.typing import DTypeLike
 from photutils.profiles import CurveOfGrowth
 from scipy.interpolate import interp1d
 from scipy.ndimage import shift
 from scipy.optimize import OptimizeWarning, curve_fit
+from scipy.signal import resample
 
 from ._units import quantity_value
 
@@ -27,6 +27,8 @@ PsfPreprocessOption: TypeAlias = PsfPreprocessor | Literal["default"] | None
 
 PEAK_METHOD_GAUSSIAN_FIT = "gaussian_fit"
 PEAK_METHOD_PIXEL_MAX = "pixel_max"
+STATS_FWHM_METHOD_CONTOUR = "contour"
+STATS_FWHM_METHOD_FOURIER_CONTOUR = "fourier_contour"
 STATS_FWHM_SUMMARY_GEOM = "geom"
 STATS_FWHM_SUMMARY_MEAN = "mean"
 STATS_FWHM_SUMMARY_MAX = "max"
@@ -36,6 +38,10 @@ PEAK_METHODS = (
     PEAK_METHOD_GAUSSIAN_FIT,
     PEAK_METHOD_PIXEL_MAX,
 )
+STATS_FWHM_METHODS = (
+    STATS_FWHM_METHOD_CONTOUR,
+    STATS_FWHM_METHOD_FOURIER_CONTOUR,
+)
 STATS_FWHM_SUMMARIES = (
     STATS_FWHM_SUMMARY_GEOM,
     STATS_FWHM_SUMMARY_MEAN,
@@ -43,6 +49,8 @@ STATS_FWHM_SUMMARIES = (
     STATS_FWHM_SUMMARY_MIN,
 )
 DEFAULT_PEAK_METHOD = PEAK_METHOD_GAUSSIAN_FIT
+DEFAULT_FWHM_METHOD = STATS_FWHM_METHOD_CONTOUR
+DEFAULT_FWHM_REFINEMENT_FACTOR = 4
 DEFAULT_FWHM_SUMMARY = STATS_FWHM_SUMMARY_GEOM
 
 EE_GEOMETRY_ENSQUARED = "ensquared"
@@ -268,6 +276,26 @@ def _require_peak_method(peak_method: str) -> str:
     if value not in PEAK_METHODS:
         raise ValueError(f"peak_method must be one of: {', '.join(PEAK_METHODS)}.")
     return value
+
+
+def _require_fwhm_method(fwhm_method: str) -> str:
+    value = str(fwhm_method).strip()
+    if value not in STATS_FWHM_METHODS:
+        raise ValueError(
+            f"fwhm_method must be one of: {', '.join(STATS_FWHM_METHODS)}."
+        )
+    return value
+
+
+def _require_fwhm_refinement_factor(fwhm_refinement_factor: int) -> int:
+    """Require a positive integer without truncating floats or accepting booleans."""
+    if (
+        isinstance(fwhm_refinement_factor, (bool, np.bool_))
+        or not isinstance(fwhm_refinement_factor, (int, np.integer))
+        or fwhm_refinement_factor < 1
+    ):
+        raise ValueError("fwhm_refinement_factor must be a positive integer.")
+    return int(fwhm_refinement_factor)
 
 
 def _require_fwhm_summary(fwhm_summary: str) -> str:
@@ -920,6 +948,43 @@ def _measure_contour_fwhms(
     return fwhm_min, fwhm_max
 
 
+def _measure_fwhms(
+    psfs: np.ndarray,
+    pixel_scale: float,
+    fwhm_method: str,
+    fwhm_refinement_factor: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Measure widths, refining only native-valid PSFs within their original extent.
+
+    Fourier interpolation pads each axis by half its length on each side,
+    rounded up. Work on one image at a time, keep interpolation undershoots,
+    and reuse the native contour's validity rules on the refined original field.
+    """
+    fwhm_min, fwhm_max = _measure_contour_fwhms(psfs, pixel_scale)
+    if fwhm_method == STATS_FWHM_METHOD_CONTOUR or fwhm_refinement_factor == 1:
+        return fwhm_min, fwhm_max
+
+    factor = fwhm_refinement_factor
+    ny, nx = psfs.shape[1:]
+    pad_y, pad_x = (ny + 1) // 2, (nx + 1) // 2
+    for index, psf in enumerate(psfs):
+        if not (np.isfinite(fwhm_min[index]) and np.isfinite(fwhm_max[index])):
+            continue
+        padded = np.pad(psf, ((pad_y, pad_y), (pad_x, pad_x)))
+        refined = resample(padded, padded.shape[0] * factor, axis=0)
+        refined = resample(refined, padded.shape[1] * factor, axis=1)
+        # Padding must not create a measurable contour beyond the supplied field.
+        refined = refined[
+            pad_y * factor : (pad_y + ny - 1) * factor + 1,
+            pad_x * factor : (pad_x + nx - 1) * factor + 1,
+        ]
+        minimum, maximum = _measure_contour_fwhms(
+            refined[np.newaxis, ...], pixel_scale / factor
+        )
+        fwhm_min[index], fwhm_max[index] = minimum[0], maximum[0]
+    return fwhm_min, fwhm_max
+
+
 def _compute_fwhm_summary(
     fwhm_summary: str, fwhm_min: np.ndarray, fwhm_max: np.ndarray
 ) -> np.ndarray:
@@ -1031,6 +1096,8 @@ def _compute_psf_stats_core(
     tel_pupil: np.ndarray | None,
     ee_apertures: np.ndarray,
     peak_method: str,
+    fwhm_method: str,
+    fwhm_refinement_factor: int,
     fwhm_summary: str,
     ee_geometry: str,
     metrics: tuple[str, ...],
@@ -1067,7 +1134,9 @@ def _compute_psf_stats_core(
         )
 
     if STATS_METRIC_FWHM in metrics:
-        fwhm_min, fwhm_max = _measure_contour_fwhms(psf_cube, pixel_scale)
+        fwhm_min, fwhm_max = _measure_fwhms(
+            psf_cube, pixel_scale, fwhm_method, fwhm_refinement_factor
+        )
         output[STATS_METRIC_FWHM] = np.asarray(
             _compute_fwhm_summary(fwhm_summary, fwhm_min, fwhm_max),
             dtype=dtype,
@@ -1106,6 +1175,8 @@ def compute_psf_stats(
     pixel_scale: u.Quantity | None = None,
     ee_apertures: u.Quantity | None = None,
     peak_method: str = DEFAULT_PEAK_METHOD,
+    fwhm_method: str = DEFAULT_FWHM_METHOD,
+    fwhm_refinement_factor: int = DEFAULT_FWHM_REFINEMENT_FACTOR,
     fwhm_summary: str = DEFAULT_FWHM_SUMMARY,
     ee_geometry: str = DEFAULT_EE_GEOMETRY,
     preprocess: PsfPreprocessOption = "default",
@@ -1131,6 +1202,13 @@ def compute_psf_stats(
             enclosed-energy anchoring. Select ``"gaussian_fit"`` or
             ``"pixel_max"``. Gaussian fits use a 5x5 patch about the brightest
             pixel, shifted inward at edges and reduced for smaller images.
+        fwhm_method: ``"contour"`` measures the native half-maximum contour
+            (default). ``"fourier_contour"`` measures it after padded Fourier
+            interpolation. Both reject truncated native contours. This choice
+            affects only FWHM, not Strehl or enclosed energy.
+        fwhm_refinement_factor: Positive integer sampling multiplier for
+            ``"fourier_contour"``; defaults to 4. One uses the native contour.
+            Validated for both methods, but unused by ``"contour"``.
         fwhm_summary: FWHM contour summary selector: ``"geom"``, ``"mean"``,
             ``"min"``, or ``"max"``.
         ee_geometry: EE aperture geometry. Defaults to ``"ensquared"`` to
@@ -1185,6 +1263,8 @@ def compute_psf_stats(
         ee_apertures = np.empty((0,), dtype=dtype)
         ee_apertures_are_per_psf = False
     peak_method = _require_peak_method(peak_method)
+    fwhm_method = _require_fwhm_method(fwhm_method)
+    fwhm_refinement_factor = _require_fwhm_refinement_factor(fwhm_refinement_factor)
     fwhm_summary = _require_fwhm_summary(fwhm_summary)
     ee_geometry = _normalize_ee_geometry(ee_geometry)
     psf_cube = _apply_preprocess(psf_cube, preprocess)
@@ -1203,6 +1283,8 @@ def compute_psf_stats(
             tel_pupil=prepared_metadata.tel_pupil,
             ee_apertures=ee_apertures,
             peak_method=peak_method,
+            fwhm_method=fwhm_method,
+            fwhm_refinement_factor=fwhm_refinement_factor,
             fwhm_summary=fwhm_summary,
             ee_geometry=ee_geometry,
             metrics=metrics,
@@ -1226,6 +1308,8 @@ def compute_psf_stats(
                 if ee_apertures_are_per_psf
                 else ee_apertures,
                 peak_method=peak_method,
+                fwhm_method=fwhm_method,
+                fwhm_refinement_factor=fwhm_refinement_factor,
                 fwhm_summary=fwhm_summary,
                 ee_geometry=ee_geometry,
                 metrics=metrics,
@@ -1334,6 +1418,8 @@ def compute_psf_fwhm(
     metadata: PsfMetadata | None = None,
     *,
     pixel_scale: u.Quantity | None = None,
+    fwhm_method: str = DEFAULT_FWHM_METHOD,
+    fwhm_refinement_factor: int = DEFAULT_FWHM_REFINEMENT_FACTOR,
     fwhm_summary: str = DEFAULT_FWHM_SUMMARY,
     preprocess: PsfPreprocessOption = "default",
     dtype: DTypeLike = np.float32,
@@ -1346,6 +1432,12 @@ def compute_psf_fwhm(
         metadata: Full physical metadata for the PSFs. Omit when supplying
             ``pixel_scale`` without Strehl metadata.
         pixel_scale: Angular pixel scale used when ``metadata`` is omitted.
+        fwhm_method: ``"contour"`` uses native sampling (default).
+            ``"fourier_contour"`` uses padded Fourier interpolation before
+            measuring the contour. Truncated native contours remain invalid.
+        fwhm_refinement_factor: Positive integer multiplier for
+            ``"fourier_contour"``, default 4; one uses native sampling.
+            Validated for both methods, but unused by ``"contour"``.
         fwhm_summary: Contour summary, ``"geom"``, ``"mean"``, ``"min"``, or
             ``"max"``.
         preprocess: Optional preprocessing control accepted by
@@ -1367,6 +1459,8 @@ def compute_psf_fwhm(
         psfs,
         metadata,
         pixel_scale=pixel_scale,
+        fwhm_method=fwhm_method,
+        fwhm_refinement_factor=fwhm_refinement_factor,
         fwhm_summary=fwhm_summary,
         preprocess=preprocess,
         dtype=dtype,
