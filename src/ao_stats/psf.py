@@ -27,6 +27,7 @@ PsfPreprocessOption: TypeAlias = PsfPreprocessor | Literal["default"] | None
 
 PEAK_METHOD_GAUSSIAN_FIT = "gaussian_fit"
 PEAK_METHOD_PIXEL_MAX = "pixel_max"
+PEAK_METHOD_FOURIER_MAX = "fourier_max"
 STATS_FWHM_METHOD_CONTOUR = "contour"
 STATS_FWHM_METHOD_FOURIER_CONTOUR = "fourier_contour"
 STATS_FWHM_SUMMARY_GEOM = "geom"
@@ -37,6 +38,7 @@ STATS_FWHM_SUMMARY_MIN = "min"
 PEAK_METHODS = (
     PEAK_METHOD_GAUSSIAN_FIT,
     PEAK_METHOD_PIXEL_MAX,
+    PEAK_METHOD_FOURIER_MAX,
 )
 STATS_FWHM_METHODS = (
     STATS_FWHM_METHOD_CONTOUR,
@@ -49,6 +51,7 @@ STATS_FWHM_SUMMARIES = (
     STATS_FWHM_SUMMARY_MIN,
 )
 DEFAULT_PEAK_METHOD = PEAK_METHOD_GAUSSIAN_FIT
+DEFAULT_PEAK_REFINEMENT_FACTOR = 4
 DEFAULT_FWHM_METHOD = STATS_FWHM_METHOD_CONTOUR
 DEFAULT_FWHM_REFINEMENT_FACTOR = 4
 DEFAULT_FWHM_SUMMARY = STATS_FWHM_SUMMARY_GEOM
@@ -285,6 +288,17 @@ def _require_fwhm_method(fwhm_method: str) -> str:
             f"fwhm_method must be one of: {', '.join(STATS_FWHM_METHODS)}."
         )
     return value
+
+
+def _require_peak_refinement_factor(peak_refinement_factor: int) -> int:
+    """Require a positive integer, even when the peak method does not refine."""
+    if (
+        isinstance(peak_refinement_factor, (bool, np.bool_))
+        or not isinstance(peak_refinement_factor, (int, np.integer))
+        or peak_refinement_factor < 1
+    ):
+        raise ValueError("peak_refinement_factor must be a positive integer.")
+    return int(peak_refinement_factor)
 
 
 def _require_fwhm_refinement_factor(fwhm_refinement_factor: int) -> int:
@@ -948,41 +962,77 @@ def _measure_contour_fwhms(
     return fwhm_min, fwhm_max
 
 
+def _refine_psf(psf: np.ndarray, factor: int) -> np.ndarray:
+    """Fourier-resample intensities, returning only the original sample extent.
+
+    Pad by half each axis length, rounded up. Preserve amplitudes, negative
+    interpolation undershoots and the native pixel origin; neither flux
+    normalization nor preprocessing is repeated. Factor one returns the input.
+    """
+    if factor == 1:
+        return psf
+    ny, nx = psf.shape
+    pad_y, pad_x = (ny + 1) // 2, (nx + 1) // 2
+    padded = np.pad(psf, ((pad_y, pad_y), (pad_x, pad_x)))
+    refined = resample(padded, padded.shape[0] * factor, axis=0)
+    refined = resample(refined, padded.shape[1] * factor, axis=1)
+    return refined[
+        pad_y * factor : (pad_y + ny - 1) * factor + 1,
+        pad_x * factor : (pad_x + nx - 1) * factor + 1,
+    ]
+
+
 def _measure_fwhms(
     psfs: np.ndarray,
     pixel_scale: float,
     fwhm_method: str,
     fwhm_refinement_factor: int,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """Measure widths, refining only native-valid PSFs within their original extent.
-
-    Fourier interpolation pads each axis by half its length on each side,
-    rounded up. Work on one image at a time, keep interpolation undershoots,
-    and reuse the native contour's validity rules on the refined original field.
-    """
+    """Measure widths, refining only native-valid PSFs within their original extent."""
     fwhm_min, fwhm_max = _measure_contour_fwhms(psfs, pixel_scale)
     if fwhm_method == STATS_FWHM_METHOD_CONTOUR or fwhm_refinement_factor == 1:
         return fwhm_min, fwhm_max
-
-    factor = fwhm_refinement_factor
-    ny, nx = psfs.shape[1:]
-    pad_y, pad_x = (ny + 1) // 2, (nx + 1) // 2
     for index, psf in enumerate(psfs):
         if not (np.isfinite(fwhm_min[index]) and np.isfinite(fwhm_max[index])):
             continue
-        padded = np.pad(psf, ((pad_y, pad_y), (pad_x, pad_x)))
-        refined = resample(padded, padded.shape[0] * factor, axis=0)
-        refined = resample(refined, padded.shape[1] * factor, axis=1)
-        # Padding must not create a measurable contour beyond the supplied field.
-        refined = refined[
-            pad_y * factor : (pad_y + ny - 1) * factor + 1,
-            pad_x * factor : (pad_x + nx - 1) * factor + 1,
-        ]
+        refined = _refine_psf(psf, fwhm_refinement_factor)
         minimum, maximum = _measure_contour_fwhms(
-            refined[np.newaxis, ...], pixel_scale / factor
+            refined[np.newaxis, ...], pixel_scale / fwhm_refinement_factor
         )
         fwhm_min[index], fwhm_max[index] = minimum[0], maximum[0]
     return fwhm_min, fwhm_max
+
+
+def _fourier_peak(psf: np.ndarray, factor: int) -> tuple[float, np.ndarray]:
+    """Measure a refined intensity maximum and its native-pixel y/x location."""
+    index = np.unravel_index(np.argmax(psf), psf.shape)
+    return float(psf[index]), np.asarray(index, dtype=psf.dtype) / factor
+
+
+def _fourier_reference_peak(
+    pixel_scale: float,
+    wavelength: float,
+    tel_diameter: float,
+    tel_pupil: np.ndarray,
+    shape: tuple[int, int],
+    factor: int,
+) -> float:
+    """Apply the same estimator to a central crop of the full-plane reference.
+
+    Bound the reference interpolation by the supplied science-image dimensions,
+    retaining its original full-plane flux scale. The ideal peak is centered
+    on a native pixel before cropping. No pupil-sized refined image is kept.
+    """
+    reference = _get_diffraction_limited_psf(
+        tel_diameter, tel_pupil, wavelength, pixel_scale, center_in_one_pix=True
+    )
+    slices = []
+    for length, requested in zip(reference.shape, shape):
+        size = min(length, requested)
+        start = length // 2 - size // 2
+        slices.append(slice(start, start + size))
+    reference = _refine_psf(reference[tuple(slices)], factor)
+    return _fourier_peak(reference, factor)[0]
 
 
 def _compute_fwhm_summary(
@@ -1087,6 +1137,64 @@ def _select_metadata_value(value: float | np.ndarray, index: int) -> float:
     return np.asarray(value)[()]
 
 
+def _compute_fourier_stats_core(
+    psfs: np.ndarray,
+    *,
+    pixel_scale: float,
+    wavelength: float | None,
+    tel_diameter: float | None,
+    tel_pupil: np.ndarray | None,
+    ee_apertures: np.ndarray,
+    peak_refinement_factor: int,
+    fwhm_method: str,
+    fwhm_refinement_factor: int,
+    fwhm_summary: str,
+    ee_geometry: str,
+    metrics: tuple[str, ...],
+) -> dict[str, np.ndarray]:
+    """Measure Fourier peaks and requested metrics with one science image in memory."""
+    dtype = psfs.dtype
+    count = psfs.shape[0]
+    amplitudes = np.empty(count, dtype=dtype)
+    locations = np.empty((count, 2), dtype=dtype)
+    measure_width = STATS_METRIC_FWHM in metrics
+    widths = np.empty((2, count), dtype=dtype) if measure_width else None
+    for index, psf in enumerate(psfs):
+        refined = _refine_psf(psf, peak_refinement_factor)
+        amplitudes[index], locations[index] = _fourier_peak(refined, peak_refinement_factor)
+        if measure_width:
+            if (fwhm_method == STATS_FWHM_METHOD_FOURIER_CONTOUR
+                    and fwhm_refinement_factor == peak_refinement_factor):
+                minimum, maximum = _measure_contour_fwhms(psf[np.newaxis], pixel_scale)
+                if np.isfinite(minimum[0]) and np.isfinite(maximum[0]):
+                    minimum, maximum = _measure_contour_fwhms(
+                        refined[np.newaxis], pixel_scale / peak_refinement_factor
+                    )
+            else:
+                minimum, maximum = _measure_fwhms(
+                    psf[np.newaxis], pixel_scale, fwhm_method, fwhm_refinement_factor
+                )
+            widths[:, index] = minimum[0], maximum[0]
+        del refined
+    output = {}
+    if STATS_METRIC_SR in metrics:
+        if wavelength is None or tel_diameter is None or tel_pupil is None:
+            raise ValueError("Strehl requires PsfMetadata with full physical metadata.")
+        denominator = _fourier_reference_peak(
+            pixel_scale, wavelength, tel_diameter, tel_pupil,
+            psfs.shape[1:], peak_refinement_factor,
+        )
+        output[STATS_METRIC_SR] = np.asarray(amplitudes / denominator, dtype=dtype)
+    if STATS_METRIC_EE in metrics:
+        # Aperture integration always uses the original image and flux scale.
+        output[STATS_METRIC_EE] = np.asarray(_compute_enclosed_energy(
+            psfs, ee_apertures, pixel_scale, locations, ee_geometry=ee_geometry,
+        ), dtype=dtype)
+    if measure_width:
+        output[STATS_METRIC_FWHM] = _compute_fwhm_summary(fwhm_summary, *widths)
+    return output
+
+
 def _compute_psf_stats_core(
     psf_cube: np.ndarray,
     *,
@@ -1096,12 +1204,23 @@ def _compute_psf_stats_core(
     tel_pupil: np.ndarray | None,
     ee_apertures: np.ndarray,
     peak_method: str,
+    peak_refinement_factor: int,
     fwhm_method: str,
     fwhm_refinement_factor: int,
     fwhm_summary: str,
     ee_geometry: str,
     metrics: tuple[str, ...],
 ) -> dict[str, np.ndarray]:
+    if peak_method == PEAK_METHOD_FOURIER_MAX and (
+        STATS_METRIC_SR in metrics or STATS_METRIC_EE in metrics
+    ):
+        return _compute_fourier_stats_core(
+            psf_cube, pixel_scale=pixel_scale, wavelength=wavelength,
+            tel_diameter=tel_diameter, tel_pupil=tel_pupil,
+            ee_apertures=ee_apertures, peak_refinement_factor=peak_refinement_factor,
+            fwhm_method=fwhm_method, fwhm_refinement_factor=fwhm_refinement_factor,
+            fwhm_summary=fwhm_summary, ee_geometry=ee_geometry, metrics=metrics,
+        )
     dtype = np.asarray(psf_cube).dtype
     output: dict[str, np.ndarray] = {}
     peak_locations_yx = None
@@ -1175,6 +1294,7 @@ def compute_psf_stats(
     pixel_scale: u.Quantity | None = None,
     ee_apertures: u.Quantity | None = None,
     peak_method: str = DEFAULT_PEAK_METHOD,
+    peak_refinement_factor: int = DEFAULT_PEAK_REFINEMENT_FACTOR,
     fwhm_method: str = DEFAULT_FWHM_METHOD,
     fwhm_refinement_factor: int = DEFAULT_FWHM_REFINEMENT_FACTOR,
     fwhm_summary: str = DEFAULT_FWHM_SUMMARY,
@@ -1199,9 +1319,13 @@ def compute_psf_stats(
             when ``"ee"`` is selected. Pass a 1D vector ``[A]`` for shared
             apertures, or a 2D array ``[M, A]`` for per-PSF apertures.
         peak_method: Shared peak estimator used for Strehl amplitude and
-            enclosed-energy anchoring. Select ``"gaussian_fit"`` or
-            ``"pixel_max"``. Gaussian fits use a 5x5 patch about the brightest
-            pixel, shifted inward at edges and reduced for smaller images.
+            enclosed-energy anchoring. Select ``"gaussian_fit"``,
+            ``"pixel_max"`` or ``"fourier_max"``. Gaussian fits use a 5x5
+            patch about the brightest pixel. Fourier maxima use padded intensity
+            interpolation within the original image extent.
+        peak_refinement_factor: Positive integer sampling multiplier for
+            ``"fourier_max"`` (default 4). One gives the native maximum.
+            Validated for all methods; unused by the other peak estimators.
         fwhm_method: ``"contour"`` measures the native half-maximum contour
             (default). ``"fourier_contour"`` measures it after padded Fourier
             interpolation. Both reject truncated native contours. This choice
@@ -1263,6 +1387,7 @@ def compute_psf_stats(
         ee_apertures = np.empty((0,), dtype=dtype)
         ee_apertures_are_per_psf = False
     peak_method = _require_peak_method(peak_method)
+    peak_refinement_factor = _require_peak_refinement_factor(peak_refinement_factor)
     fwhm_method = _require_fwhm_method(fwhm_method)
     fwhm_refinement_factor = _require_fwhm_refinement_factor(fwhm_refinement_factor)
     fwhm_summary = _require_fwhm_summary(fwhm_summary)
@@ -1283,6 +1408,7 @@ def compute_psf_stats(
             tel_pupil=prepared_metadata.tel_pupil,
             ee_apertures=ee_apertures,
             peak_method=peak_method,
+            peak_refinement_factor=peak_refinement_factor,
             fwhm_method=fwhm_method,
             fwhm_refinement_factor=fwhm_refinement_factor,
             fwhm_summary=fwhm_summary,
@@ -1308,6 +1434,7 @@ def compute_psf_stats(
                 if ee_apertures_are_per_psf
                 else ee_apertures,
                 peak_method=peak_method,
+                peak_refinement_factor=peak_refinement_factor,
                 fwhm_method=fwhm_method,
                 fwhm_refinement_factor=fwhm_refinement_factor,
                 fwhm_summary=fwhm_summary,
@@ -1329,6 +1456,7 @@ def compute_psf_sr(
     metadata: PsfMetadata,
     *,
     peak_method: str = DEFAULT_PEAK_METHOD,
+    peak_refinement_factor: int = DEFAULT_PEAK_REFINEMENT_FACTOR,
     preprocess: PsfPreprocessOption = "default",
     dtype: DTypeLike = np.float32,
 ) -> StatValue:
@@ -1338,7 +1466,10 @@ def compute_psf_sr(
         dtype: Real calculation/output precision, float32 (default) or float64.
         psfs: PSF image ``[Ny, Nx]`` or PSF cube ``[M, Ny, Nx]``.
         metadata: Physical metadata for the PSFs.
-        peak_method: Peak estimator, ``"gaussian_fit"`` or ``"pixel_max"``.
+        peak_method: ``"gaussian_fit"``, ``"pixel_max"`` or ``"fourier_max"``.
+        peak_refinement_factor: Positive integer Fourier peak sampling
+            multiplier (default 4); one gives the native maximum. Validated
+            even when unused by the selected estimator.
         preprocess: Preprocessing control accepted by ``compute_psf_stats``.
 
     Returns:
@@ -1356,6 +1487,7 @@ def compute_psf_sr(
         psfs,
         metadata,
         peak_method=peak_method,
+        peak_refinement_factor=peak_refinement_factor,
         preprocess=preprocess,
         dtype=dtype,
         metrics=(STATS_METRIC_SR,),
@@ -1370,6 +1502,7 @@ def compute_psf_ee(
     ee_apertures: u.Quantity,
     pixel_scale: u.Quantity | None = None,
     peak_method: str = DEFAULT_PEAK_METHOD,
+    peak_refinement_factor: int = DEFAULT_PEAK_REFINEMENT_FACTOR,
     ee_geometry: str = DEFAULT_EE_GEOMETRY,
     preprocess: PsfPreprocessOption = "default",
     dtype: DTypeLike = np.float32,
@@ -1384,7 +1517,10 @@ def compute_psf_ee(
         ee_apertures: Aperture-diameter quantity. Pass shape ``[A]`` for
             shared apertures or ``[M, A]`` for per-PSF apertures.
         pixel_scale: Angular pixel scale used when ``metadata`` is omitted.
-        peak_method: Peak estimator, ``"gaussian_fit"`` or ``"pixel_max"``.
+        peak_method: ``"gaussian_fit"``, ``"pixel_max"`` or ``"fourier_max"``.
+        peak_refinement_factor: Positive integer Fourier peak sampling
+            multiplier (default 4); one gives the native maximum. Validated
+            even when unused by the selected estimator.
         ee_geometry: Aperture geometry, ``"ensquared"`` or ``"encircled"``.
         preprocess: Preprocessing control accepted by ``compute_psf_stats``.
 
@@ -1405,6 +1541,7 @@ def compute_psf_ee(
         pixel_scale=pixel_scale,
         ee_apertures=ee_apertures,
         peak_method=peak_method,
+        peak_refinement_factor=peak_refinement_factor,
         ee_geometry=ee_geometry,
         preprocess=preprocess,
         dtype=dtype,

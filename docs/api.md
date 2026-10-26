@@ -82,7 +82,8 @@ Strehl cannot be requested through the pixel-scale-only path.
 
 | Measurement | Options | Default | Result unit |
 | --- | --- | --- | --- |
-| Shared peak estimator | `gaussian_fit`, `pixel_max` | `gaussian_fit` | — |
+| Shared peak estimator | `gaussian_fit`, `pixel_max`, `fourier_max` | `gaussian_fit` | — |
+| Peak refinement factor | Positive integer | `4` | — |
 | Strehl ratio | Uses the shared peak estimator | — | dimensionless |
 | Enclosed energy geometry | `ensquared`, `encircled` | `ensquared` | dimensionless |
 | FWHM method | `contour`, `fourier_contour` | `contour` | milliarcseconds |
@@ -105,6 +106,52 @@ physical metadata describe an integer padding size.
 `ee_apertures` contains aperture diameters in angular units. Supply a
 one-dimensional array to use the same apertures for every PSF, or an `[M, A]`
 array to use `A` aperture sizes for each PSF in a cube.
+
+### Fourier Peak Estimation
+
+Select `peak_method="fourier_max"` to measure the maximum after padded Fourier
+interpolation of the intensity image. `compute_psf_sr`, `compute_psf_ee` and
+`compute_psf_stats` accept `peak_refinement_factor`:
+
+```python
+from ao_stats import compute_psf_sr
+
+sr = compute_psf_sr(
+    normalized_psfs,
+    metadata,
+    peak_method="fourier_max",
+    peak_refinement_factor=8,
+    preprocess=None,
+)
+```
+
+The factor defaults to 4 for this optional method, matching Fourier FWHM.
+Use an explicit factor of 8 for the more coarsely sampled ELT PSFs, as in the
+example above. It must be a positive integer;
+booleans and floating-point values are rejected. It is validated even when unused
+by another peak method or metric subset. Factor one uses the native maximum.
+The default peak estimator remains `gaussian_fit`.
+
+Peak estimation and Fourier FWHM share the padding and resampling operation
+described below. The maximum is searched only within the original sample extent;
+its location is converted back to native pixel coordinates. Enclosed energy uses
+that location to integrate the original pixels, never the interpolated image.
+Interpolation undershoots are preserved and preprocessing is not repeated.
+
+Strehl applies the same peak estimator to a diffraction-limited reference
+normalized over its complete Fourier plane. Before interpolation the reference
+is centrally cropped to at most the science-image dimensions, preserving its
+full-plane flux scale. Neither reference nor science crop is renormalized by
+the interpolation. Callers must still supply the actual pupil, its physical
+support diameter, wavelength and angular pixel scale.
+
+The peak and FWHM factors are independent. A combined call reuses each refined
+science image when both Fourier methods request the same factor; it processes
+one science image at a time. Refinement reduces grid-position error for adequately
+sampled PSFs. It cannot recover an undersampled or missing peak, certify that
+a crop contains the true maximum, or suppress noise. Small crops and discontinuous
+edges can cause interpolation artifacts. A higher factor alone does not establish
+accuracy.
 
 ### FWHM Sampling
 

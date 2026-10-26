@@ -27,7 +27,7 @@ def test_public_calculation_signatures_are_available() -> None:
         "pixel_scale",
         "ee_apertures",
         "peak_method",
-        "fwhm_method",
+        "peak_refinement_factor",        "fwhm_method",
         "fwhm_refinement_factor",
         "fwhm_summary",
         "ee_geometry",
@@ -39,7 +39,7 @@ def test_public_calculation_signatures_are_available() -> None:
         "psfs",
         "metadata",
         "peak_method",
-        "preprocess",
+        "peak_refinement_factor",        "preprocess",
         "dtype",
     )
     assert tuple(inspect.signature(ao_stats.compute_psf_ee).parameters) == (
@@ -48,7 +48,7 @@ def test_public_calculation_signatures_are_available() -> None:
         "ee_apertures",
         "pixel_scale",
         "peak_method",
-        "ee_geometry",
+        "peak_refinement_factor",        "ee_geometry",
         "preprocess",
         "dtype",
     )

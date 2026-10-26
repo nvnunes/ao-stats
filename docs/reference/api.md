@@ -27,8 +27,10 @@ The supported API is imported from the `ao_stats` package root.
 | --- | --- |
 | `PEAK_METHOD_GAUSSIAN_FIT` | `"gaussian_fit"` |
 | `PEAK_METHOD_PIXEL_MAX` | `"pixel_max"` |
-| `PEAK_METHODS` | `("gaussian_fit", "pixel_max")` |
+| `PEAK_METHOD_FOURIER_MAX` | `"fourier_max"` |
+| `PEAK_METHODS` | `("gaussian_fit", "pixel_max", "fourier_max")` |
 | `DEFAULT_PEAK_METHOD` | `"gaussian_fit"` |
+| `DEFAULT_PEAK_REFINEMENT_FACTOR` | `4` |
 
 ## Enclosed-energy Constants
 
