@@ -78,23 +78,43 @@ The focused `compute_psf_ee` and `compute_psf_fwhm` functions accept the same
 have one value per PSF. Supplying both `metadata` and `pixel_scale` is an error.
 Strehl cannot be requested through the pixel-scale-only path.
 
+### Supplied Peak Positions
+
+Pass `peak_locations=(y, x)` to `compute_psf_stats` to bypass automatic
+peak selection. For a cube, supply one pair per PSF as an `[M, 2]` array.
+Use plain numbers or a quantity in pixels. Coordinates are zero-based and
+may be fractional within the first and last native pixel centers on each axis.
+
+- **Strehl and FWHM** use the native intensity at an integer position.
+  For a fractional position, they sample the Fourier-refined image by
+  bilinear interpolation using `peak_refinement_factor`. Strehl uses the
+  Fourier diffraction reference at that refinement and rejects negative
+  samples. FWHM measures the enclosing contour at half the sampled intensity
+  using the selected [contour method](#fwhm-sampling).
+- **Enclosed energy** centers the aperture at the supplied position. For
+  square apertures, each PSF's curve stops at the largest sampled aperture
+  that fits in its image. For larger requested apertures, the returned
+  energy is extrapolated and clipped to `[0, 1]`. If the curve has just
+  one sample, AO Stats returns that value for every requested aperture.
+
 ## Measurement Options
 
 | Measurement | Options | Default | Result unit |
 | --- | --- | --- | --- |
-| Shared peak estimator | `gaussian_fit`, `pixel_max`, `fourier_max` | `gaussian_fit` | — |
+| Automatic peak estimator | `gaussian_fit`, `pixel_max`, `fourier_max` | `gaussian_fit` | — |
 | Peak refinement factor | Positive integer | `4` | — |
-| Strehl ratio | Uses the shared peak estimator | — | dimensionless |
+| Strehl ratio | Automatic or supplied peak | — | dimensionless |
 | Enclosed energy geometry | `ensquared`, `encircled` | `ensquared` | dimensionless |
 | FWHM method | `contour`, `fourier_contour` | `contour` | milliarcseconds |
 | FWHM refinement factor | Positive integer | `4` | — |
 | FWHM summary | `geom`, `mean`, `min`, `max` | `geom` | milliarcseconds |
 
-`gaussian_fit` locates the brightest pixel in each PSF and fits a Gaussian
-within a 5×5 patch around it, regardless of image parity. At an image edge,
-the patch shifts inward to keep its full size; axes shorter than five pixels
-use all available pixels. The fitted amplitude feeds Strehl and the fitted
-subpixel location centers enclosed-energy apertures. Strehl uses the same
+For automatic peak selection, `gaussian_fit` locates the brightest pixel
+in each PSF and fits a Gaussian within a 5×5 patch around it, regardless of
+image parity. At an image edge, the patch shifts inward to keep its full
+size. Axes shorter than five pixels use all available pixels. The fitted
+amplitude feeds Strehl and the fitted subpixel location centers
+enclosed-energy apertures. Strehl uses the same
 estimator for the diffraction-limited reference. `pixel_max` uses the brightest
 pixel's value and integer location directly.
 
@@ -109,9 +129,10 @@ array to use `A` aperture sizes for each PSF in a cube.
 
 ### Fourier Peak Estimation
 
-Select `peak_method="fourier_max"` to measure the maximum after padded Fourier
-interpolation of the intensity image. `compute_psf_sr`, `compute_psf_ee` and
-`compute_psf_stats` accept `peak_refinement_factor`:
+For automatic peak selection, set `peak_method="fourier_max"` to measure the
+maximum after padded Fourier interpolation of the intensity image.
+`compute_psf_sr`, `compute_psf_ee` and `compute_psf_stats` accept
+`peak_refinement_factor`:
 
 ```python
 from ao_stats import compute_psf_sr
@@ -125,18 +146,17 @@ sr = compute_psf_sr(
 )
 ```
 
-The factor defaults to 4 for this optional method, matching Fourier FWHM.
-Use an explicit factor of 8 for the more coarsely sampled ELT PSFs, as in the
-example above. It must be a positive integer;
-booleans and floating-point values are rejected. It is validated even when unused
-by another peak method or metric subset. Factor one uses the native maximum.
-The default peak estimator remains `gaussian_fit`.
+The factor defaults to 4 and sets the Fourier grid for peak searches and
+intensity sampling. Use an explicit factor of 8 for the more coarsely sampled
+ELT PSFs, as in the example above. The factor must be a positive integer.
+AO Stats validates it for every metric subset. A factor of one uses the native
+grid. The default automatic peak estimator is `gaussian_fit`.
 
 Peak estimation and Fourier FWHM share the padding and resampling operation
-described below. The maximum is searched only within the original sample extent;
-its location is converted back to native pixel coordinates. Enclosed energy uses
-that location to integrate the original pixels, never the interpolated image.
-Interpolation undershoots are preserved and preprocessing is not repeated.
+described below. AO Stats searches for the maximum within the original sample
+extent and converts its location back to native pixels. Enclosed energy
+centers the aperture using the native-grid PSF. Fourier refinement preserves
+interpolation undershoots and skips repeated preprocessing.
 
 Strehl applies the same peak estimator to a diffraction-limited reference
 normalized over its complete Fourier plane. Before interpolation the reference
@@ -146,12 +166,12 @@ the interpolation. Callers must still supply the actual pupil, its physical
 support diameter, wavelength and angular pixel scale.
 
 The peak and FWHM factors are independent. A combined call reuses each refined
-science image when both Fourier methods request the same factor; it processes
-one science image at a time. Refinement reduces grid-position error for adequately
-sampled PSFs. It cannot recover an undersampled or missing peak, certify that
-a crop contains the true maximum, or suppress noise. Small crops and discontinuous
-edges can cause interpolation artifacts. A higher factor alone does not establish
-accuracy.
+science image when peak sampling and Fourier FWHM use the same factor.
+It processes one science image at a time. Refinement reduces grid-position
+error for adequately sampled PSFs. It cannot recover an undersampled or missing
+peak, certify that a crop contains the true maximum, or suppress noise.
+Small crops and discontinuous edges can cause interpolation artifacts.
+A higher factor alone does not establish accuracy.
 
 ### FWHM Sampling
 

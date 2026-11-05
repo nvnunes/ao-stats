@@ -17,10 +17,12 @@ Every public calculation follows the same flow:
 6. Return Astropy quantities at the selected precision with shapes appropriate to a single PSF
    or cube.
 
-The combined `compute_psf_stats` function shares validation, preprocessing,
-and one selected peak estimate across requested measurements. Its amplitude
-feeds Strehl and its location anchors enclosed energy. Focused public functions
-provide direct access to one measurement.
+The combined `compute_psf_stats` function shares validation and preprocessing
+across metrics. With automatic peak selection, Strehl and enclosed energy
+share a peak estimate, and FWHM sets its contour level from the image maximum
+on its measurement grid. A [supplied peak position](api.md#supplied-peak-positions)
+anchors all three metrics. Callers own peak tracking and resampling of PSFs.
+Focused public functions provide direct access to one measurement.
 
 ## Ownership
 

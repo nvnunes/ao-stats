@@ -114,8 +114,10 @@ def test_cube_focused_methods_preserve_flux_and_preprocessing(dtype, per_psf):
     np.testing.assert_array_equal(source, original)
 
 
-def test_combined_call_reuses_each_refined_image(monkeypatch):
+@pytest.mark.parametrize("peak", [None, (20.25, 21.5), (20, 21)])
+def test_combined_call_reuses_each_refined_image(monkeypatch, peak):
     image, metadata, _ = optical_psf()
+    locations = [peak] * 2 if peak is not None else None
     original = module._refine_psf
     seen = []
     def counted(image, factor):
@@ -124,17 +126,22 @@ def test_combined_call_reuses_each_refined_image(monkeypatch):
     monkeypatch.setattr(module, "_refine_psf", counted)
     compute_psf_stats(np.stack([image,image]), metadata, ee_apertures=[15]*u.mas,
                       peak_method="fourier_max", fwhm_method="fourier_contour",
-                      fwhm_refinement_factor=4, preprocess=None, dtype=np.float64)
+                      peak_locations=locations, fwhm_refinement_factor=4,
+                      preprocess=None, dtype=np.float64)
     # Two science images plus one reference; no extra interpolation for FWHM.
     assert len(seen) == 3
 
 
-def test_fwhm_only_does_not_compute_unused_fourier_peaks(monkeypatch):
+@pytest.mark.parametrize("peak", [None, (20, 21)])
+def test_fwhm_only_does_not_compute_unused_fourier_peaks(monkeypatch, peak):
     image, _, _ = optical_psf()
     def forbidden(*args, **kwargs):
         raise AssertionError("Unused peak interpolation")
     monkeypatch.setattr(module, "_refine_psf", forbidden)
-    result = compute_psf_stats(image, pixel_scale=1*u.mas, metrics=("fwhm",), peak_method="fourier_max")
+    result = compute_psf_stats(
+        image, pixel_scale=1*u.mas, metrics=("fwhm",), peak_method="fourier_max",
+        peak_locations=peak,
+    )
     assert np.isfinite(result[0].value)
 
 
@@ -194,3 +201,123 @@ def test_default_fourier_peak_factor_is_explicit_four():
     explicit = compute_psf_stats(image, metadata, peak_refinement_factor=4, **options)
     for actual, expected in zip(default, explicit):
         np.testing.assert_array_equal(actual, expected)
+
+
+@pytest.mark.parametrize("factor", [1, 4])
+def test_supplied_detected_peak_matches_single_core_measurements(factor):
+    image, metadata, _ = optical_psf()
+    refined = module._refine_psf(image, factor)
+    peak_yx = np.asarray(np.unravel_index(refined.argmax(), refined.shape)) / factor
+    options = dict(
+        ee_apertures=[100] * u.mas, peak_method="fourier_max",
+        peak_refinement_factor=factor, fwhm_method="fourier_contour",
+        fwhm_refinement_factor=factor, preprocess=None, dtype=np.float64,
+    )
+    automatic = compute_psf_stats(image, metadata, **options)
+    supplied = compute_psf_stats(image, metadata, peak_locations=peak_yx, **options)
+    for actual, expected in zip(supplied, automatic, strict=True):
+        assert np.isfinite(actual.value)
+        np.testing.assert_allclose(actual.value, expected.value, rtol=1e-12)
+
+
+def test_supplied_fractional_peak_under_default_peak_method():
+    image, metadata, _ = optical_psf(sampling=2, offset=(0.5, 0.5), strength=0)
+    fitted_peak = module._compute_peak_locations(image[None], DEFAULT_PEAK_METHOD)[0]
+    options = dict(
+        ee_apertures=[100] * u.mas, fwhm_method="fourier_contour",
+        preprocess=None, dtype=np.float64,
+    )
+    automatic = compute_psf_stats(image, metadata, **options)
+    supplied = compute_psf_stats(image, metadata, peak_locations=fitted_peak, **options)
+    for actual, expected in zip(supplied, automatic, strict=True):
+        np.testing.assert_allclose(actual.value, expected.value, rtol=0.005)
+
+
+def test_supplied_peak_accepts_pixel_quantities():
+    image, _, _ = optical_psf()
+    locations = np.array([20.25, 21.5])
+    options = dict(pixel_scale=1 * u.mas, metrics=("fwhm",))
+    pixels = compute_psf_stats(image, peak_locations=locations * u.pix, **options)
+    plain = compute_psf_stats(image, peak_locations=locations, **options)
+    np.testing.assert_array_equal(pixels[0], plain[0])
+
+
+def test_supplied_aperture_edge_limit_applies_to_each_psf():
+    y, x = np.indices((41, 41))
+    locations = [(20, 20), (1, 1)]
+    psfs = np.array([
+        np.exp(-((y - cy)**2 + (x - cx)**2) / 18)
+        for cy, cx in locations
+    ])
+    options = dict(pixel_scale=10 * u.mas, ee_apertures=[100] * u.mas, metrics=("ee",))
+    (cube_ee,) = compute_psf_stats(psfs, peak_locations=locations, **options)
+    for i, (psf, location) in enumerate(zip(psfs, locations, strict=True)):
+        (single_ee,) = compute_psf_stats(psf, peak_locations=location, **options)
+        np.testing.assert_array_equal(cube_ee[i, 0], single_ee)
+
+
+def test_supplied_peak_rejects_negative_strehl_sample():
+    _, metadata, _ = optical_psf()
+    psf = np.zeros((25, 27))
+    psf[12, 13] = 1
+    options = dict(metrics=("sr",), peak_method="fourier_max", preprocess=None, dtype=np.float64)
+    (zero,) = compute_psf_stats(psf, metadata, peak_locations=(13, 13), **options)
+    assert zero.value == 0
+    with pytest.raises(ValueError, match="negative Strehl intensity"):
+        compute_psf_stats(psf, metadata, peak_locations=(13.5, 13), **options)
+
+
+@pytest.mark.parametrize("per_psf", [False, True])
+def test_supplied_peak_measures_core_with_brighter_separate_speckle(per_psf):
+    _, metadata, _ = optical_psf()
+    y, x = np.indices((65, 71))
+    core_yx, speckle_yx = (28, 22), (36, 53)
+    core = 0.004 * np.exp(-0.5 * (((y - 28) / 2.0)**2 + ((x - 22) / 2.5)**2))
+    speckle = 0.008 * np.exp(-0.5 * (((y - 36) / 3.0)**2 + ((x - 53) / 4.0)**2))
+    image = core + speckle
+    options = dict(
+        ee_apertures=[100] * u.mas, peak_method="pixel_max",
+        preprocess=None, dtype=np.float64,
+    )
+    vector_metadata = metadata
+    if per_psf:
+        vector_metadata = PsfMetadata(
+            metadata.wavelength * np.ones(2), metadata.pixel_scale * np.ones(2),
+            metadata.tel_diameter, metadata.tel_pupil,
+        )
+    anchored = compute_psf_stats(
+        np.stack([image, image]), vector_metadata,
+        peak_locations=np.array([core_yx, speckle_yx]), **options,
+    )
+    expected_core = compute_psf_stats(core, metadata, **options)
+    expected_speckle = compute_psf_stats(image, metadata, **options)
+    for actual, core_metric, speckle_metric in zip(
+        anchored, expected_core, expected_speckle, strict=True
+    ):
+        np.testing.assert_allclose(actual[0].value, core_metric.value, rtol=1e-8)
+        np.testing.assert_allclose(actual[1].value, speckle_metric.value, rtol=1e-12)
+        assert actual[0] < actual[1]
+
+
+@pytest.mark.parametrize(
+    ("cube", "locations", "message"),
+    [
+        (False, [[4, 4]], "shape"),
+        (True, [4, 4], "shape"),
+        (True, [[4, 4]], "shape"),
+        (False, [np.nan, 4], "finite real"),
+        (False, [4, np.inf], "finite real"),
+        (False, [4, 4 + 1j], "finite real"),
+        (False, [4, 4] * u.mas, "units equivalent to 'pix'"),
+        (False, [-0.01, 4], "bounds"),
+        (False, [8, 10.01], "bounds"),
+    ],
+)
+def test_supplied_peak_validation(cube, locations, message):
+    image = np.ones((9, 11))
+    psfs = np.stack([image, image]) if cube else image
+    with pytest.raises(ValueError, match=f"peak_locations.*{message}"):
+        compute_psf_stats(
+            psfs, pixel_scale=1 * u.mas, metrics=("fwhm",),
+            peak_locations=locations,
+        )
