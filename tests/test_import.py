@@ -33,6 +33,7 @@ def test_public_calculation_signatures_are_available() -> None:
         "fwhm_refinement_factor",
         "fwhm_summary",
         "ee_geometry",
+        "ee_center",
         "preprocess",
         "metrics",
         "dtype",
@@ -50,7 +51,9 @@ def test_public_calculation_signatures_are_available() -> None:
         "ee_apertures",
         "pixel_scale",
         "peak_method",
-        "peak_refinement_factor",        "ee_geometry",
+        "peak_refinement_factor",
+        "ee_geometry",
+        "ee_center",
         "preprocess",
         "dtype",
     )
@@ -66,5 +69,13 @@ def test_public_calculation_signatures_are_available() -> None:
     )
 
 
+def test_ee_center_constants_are_available() -> None:
+    assert {"EE_CENTER_PEAK", "EE_CENTER_IMAGE", "EE_CENTERS", "DEFAULT_EE_CENTER"} <= set(
+        ao_stats.__all__
+    )
+    assert ao_stats.EE_CENTERS == (ao_stats.EE_CENTER_PEAK, ao_stats.EE_CENTER_IMAGE) == ("peak", "image")
+    assert ao_stats.DEFAULT_EE_CENTER == ao_stats.EE_CENTER_PEAK
+
+
 def test_version_present() -> None:
-    assert ao_stats.__version__ == "0.1.0"
+    assert ao_stats.__version__ == "0.1.1"

@@ -19,9 +19,11 @@ Every public calculation follows the same flow:
 
 The combined `compute_psf_stats` function shares validation and preprocessing
 across metrics. With automatic peak selection, Strehl and enclosed energy
-share a peak estimate, and FWHM sets its contour level from the image maximum
-on its measurement grid. A [supplied peak position](api.md#supplied-peak-positions)
-anchors all three metrics. Callers own peak tracking and resampling of PSFs.
+share a peak estimate when EE uses peak centering. FWHM sets its contour
+level from the image maximum on its measurement grid. A
+[supplied peak position](api.md#supplied-peak-positions) anchors SR, FWHM,
+and peak-centered EE. The image-centered EE option uses the cutout midpoint.
+Callers own peak tracking and resampling of PSFs.
 Focused public functions provide direct access to one measurement.
 
 ## Ownership

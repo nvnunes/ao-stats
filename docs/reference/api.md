@@ -40,6 +40,10 @@ The supported API is imported from the `ao_stats` package root.
 | `EE_GEOMETRY_ENCIRCLED` | `"encircled"` |
 | `EE_GEOMETRIES` | `("ensquared", "encircled")` |
 | `DEFAULT_EE_GEOMETRY` | `"ensquared"` |
+| `EE_CENTER_PEAK` | `"peak"` |
+| `EE_CENTER_IMAGE` | `"image"` |
+| `EE_CENTERS` | `("peak", "image")` |
+| `DEFAULT_EE_CENTER` | `"peak"` |
 
 ## FWHM Constants
 

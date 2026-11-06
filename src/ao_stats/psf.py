@@ -61,6 +61,11 @@ EE_GEOMETRY_ENCIRCLED = "encircled"
 EE_GEOMETRIES = (EE_GEOMETRY_ENSQUARED, EE_GEOMETRY_ENCIRCLED)
 DEFAULT_EE_GEOMETRY = EE_GEOMETRY_ENSQUARED
 
+EE_CENTER_PEAK = "peak"
+EE_CENTER_IMAGE = "image"
+EE_CENTERS = (EE_CENTER_PEAK, EE_CENTER_IMAGE)
+DEFAULT_EE_CENTER = EE_CENTER_PEAK
+
 STATS_METRIC_SR = "sr"
 STATS_METRIC_EE = "ee"
 STATS_METRIC_FWHM = "fwhm"
@@ -696,11 +701,11 @@ def _compute_peak_locations(psfs: np.ndarray, peak_method: str) -> np.ndarray:
 # Enclosed Energy helpers
 
 
-def _anchor_psfs_for_ee(
+def _anchor_psfs_for_ensquared_energy(
     psfs: np.ndarray,
     peak_locations_yx: np.ndarray | None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Return PSFs plus integer peak anchors for enclosed energy."""
+    """Return PSFs plus integer anchors for square apertures."""
     dtype = np.asarray(psfs).dtype
     psfs = np.asarray(psfs, dtype=dtype)
     num_sci, _ny, nx = psfs.shape
@@ -779,10 +784,10 @@ def _measure_peak_centered_ensquared_energy_curves(
     return ee_curves, unique_radii
 
 
-def _measure_peak_centered_encircled_energy_cog(
+def _measure_encircled_energy_cog(
     psfs: np.ndarray,
-    peak_y: np.ndarray,
-    peak_x: np.ndarray,
+    center_y: np.ndarray,
+    center_x: np.ndarray,
     ee_radii: np.ndarray,
     pixel_scale: float,
 ) -> np.ndarray:
@@ -797,7 +802,7 @@ def _measure_peak_centered_encircled_energy_cog(
     ee = np.empty((psfs.shape[0], radii_pix.size), dtype=dtype)
     for i, psf in enumerate(psfs):
         curve = CurveOfGrowth(
-            psf, (float(peak_x[i]), float(peak_y[i])), cog_radii_pix, method="exact"
+            psf, (float(center_x[i]), float(center_y[i])), cog_radii_pix, method="exact"
         )
         ee[i, :] = np.asarray(curve.profile[: radii_pix.size], dtype=dtype)
     return ee
@@ -850,45 +855,36 @@ def _compute_enclosed_energy(
     ee_apertures = np.asarray(ee_apertures, dtype=dtype)
     ee_radii = ee_apertures / 2.0
 
-    psfs, peak_y, peak_x = _anchor_psfs_for_ee(psfs, peak_locations_yx)
-
-    if ee_geometry == EE_GEOMETRY_ENSQUARED:
-        _, ny, nx = psfs.shape
-
-        # Use only aperture radii that fit around every peak anchor in the cube.
-        # This keeps all PSFs on the same valid peak-centered grid.
-        edge_limited_radius = int(
-            np.min(np.stack([peak_y, ny - 1 - peak_y, peak_x, nx - 1 - peak_x]))
+    if ee_geometry == EE_GEOMETRY_ENCIRCLED:
+        if peak_locations_yx is None:
+            peak_locations_yx = _compute_peak_locations(psfs, PEAK_METHOD_PIXEL_MAX)
+        center_y, center_x = np.asarray(peak_locations_yx).T
+        return _measure_encircled_energy_cog(
+            psfs, center_y, center_x, ee_radii, pixel_scale,
         )
 
-        # Square aperture index r has physical half-width (r + 0.5) pixels.
-        # So, r=0 corresponds to the peak pixel alone, r=1 includes the 8 surrounding pixels, etc.
-        required_radius = int(np.ceil(ee_radii.max() / pixel_scale - 0.5))
+    psfs, peak_y, peak_x = _anchor_psfs_for_ensquared_energy(psfs, peak_locations_yx)
+    _, ny, nx = psfs.shape
 
-        # Compute beyond the requested radius so interpolation is not pinned to
-        # the final sampled point of the cumulative EE curve.
-        max_radius_factor = 2.0
-        max_radius = min(
-            edge_limited_radius,
-            int(np.ceil(max(0, required_radius) * max_radius_factor)),
-        )
-        ee_curves, curve_radii_mas = _measure_peak_centered_ensquared_energy_curves(
-            psfs,
-            peak_y,
-            peak_x,
-            max_radius,
-            pixel_scale,
-        )
-        ee_at_radius = _interpolate_ee_at_radii(ee_curves, curve_radii_mas, ee_radii)
-    else:
-        ee_at_radius = _measure_peak_centered_encircled_energy_cog(
-            psfs,
-            peak_y,
-            peak_x,
-            ee_radii,
-            pixel_scale,
-        )
+    # Use only aperture radii that fit around every anchor in the cube.
+    edge_limited_radius = int(
+        np.min(np.stack([peak_y, ny - 1 - peak_y, peak_x, nx - 1 - peak_x]))
+    )
 
+    # Square aperture index r has physical half-width (r + 0.5) pixels.
+    required_radius = int(np.ceil(ee_radii.max() / pixel_scale - 0.5))
+
+    # Compute beyond the requested radius so interpolation is not pinned to
+    # the final sampled point of the cumulative EE curve.
+    max_radius_factor = 2.0
+    max_radius = min(
+        edge_limited_radius,
+        int(np.ceil(max(0, required_radius) * max_radius_factor)),
+    )
+    ee_curves, curve_radii_mas = _measure_peak_centered_ensquared_energy_curves(
+        psfs, peak_y, peak_x, max_radius, pixel_scale,
+    )
+    ee_at_radius = _interpolate_ee_at_radii(ee_curves, curve_radii_mas, ee_radii)
     return np.asarray(ee_at_radius, dtype=dtype)
 
 
@@ -1301,23 +1297,35 @@ def _compute_psf_stats_core(
     fwhm_refinement_factor: int,
     fwhm_summary: str,
     ee_geometry: str,
+    ee_center: Literal["peak", "image"],
     metrics: tuple[str, ...],
     peak_locations_yx: np.ndarray | None,
 ) -> dict[str, np.ndarray]:
+    output: dict[str, np.ndarray] = {}
+    if ee_center == EE_CENTER_IMAGE and STATS_METRIC_EE in metrics:
+        center = (np.asarray(psf_cube.shape[-2:]) - 1) / 2
+        centers = np.broadcast_to(center, (psf_cube.shape[0], 2))
+        output[STATS_METRIC_EE] = _compute_enclosed_energy(
+            psf_cube, ee_apertures, pixel_scale, centers, ee_geometry=ee_geometry,
+        )
+        metrics = tuple(metric for metric in metrics if metric != STATS_METRIC_EE)
+        if not metrics:
+            return output
+
     uses_fourier_peak = peak_method == PEAK_METHOD_FOURIER_MAX and (
         STATS_METRIC_SR in metrics or STATS_METRIC_EE in metrics
     )
     if peak_locations_yx is not None or uses_fourier_peak:
-        return _compute_sampled_stats(
+        output.update(_compute_sampled_stats(
             psf_cube, pixel_scale=pixel_scale, wavelength=wavelength,
             tel_diameter=tel_diameter, tel_pupil=tel_pupil,
             ee_apertures=ee_apertures,
             peak_locations_yx=peak_locations_yx, peak_refinement_factor=peak_refinement_factor,
             fwhm_method=fwhm_method, fwhm_refinement_factor=fwhm_refinement_factor,
             fwhm_summary=fwhm_summary, ee_geometry=ee_geometry, metrics=metrics,
-        )
+        ))
+        return output
     dtype = np.asarray(psf_cube).dtype
-    output: dict[str, np.ndarray] = {}
 
     if STATS_METRIC_SR in metrics:
         if wavelength is None or tel_diameter is None or tel_pupil is None:
@@ -1389,6 +1397,7 @@ def compute_psf_stats(
     fwhm_refinement_factor: int = DEFAULT_FWHM_REFINEMENT_FACTOR,
     fwhm_summary: str = DEFAULT_FWHM_SUMMARY,
     ee_geometry: str = DEFAULT_EE_GEOMETRY,
+    ee_center: Literal["peak", "image"] = DEFAULT_EE_CENTER,
     preprocess: PsfPreprocessOption = "default",
     metrics: Sequence[str] | None = None,
     dtype: DTypeLike = np.float32,
@@ -1409,7 +1418,7 @@ def compute_psf_stats(
             when ``"ee"`` is selected. Pass a 1D vector ``[A]`` for shared
             apertures, or a 2D array ``[M, A]`` for per-PSF apertures.
         peak_method: Automatic peak estimator used for Strehl amplitude and
-            enclosed-energy anchoring. Select ``"gaussian_fit"``,
+            peak-centered enclosed energy. Select ``"gaussian_fit"``,
             ``"pixel_max"`` or ``"fourier_max"``. Gaussian fits use a 5x5
             patch about the brightest pixel. Fourier maxima use padded intensity
             interpolation within the original image extent.
@@ -1422,11 +1431,9 @@ def compute_psf_stats(
             at integer coordinates and bilinearly sample the Fourier-refined
             image at fractional ones.
             Strehl uses the Fourier diffraction reference at the same
-            refinement factor and rejects negative samples. EE centers the
-            aperture at the coordinate. Square-aperture EE extrapolates
-            beyond the sampled curve for each PSF, or returns the sole sample
-            when the curve contains just one. FWHM uses the enclosing contour
-            at half the sampled intensity.
+            refinement factor and rejects negative samples. With
+            ``ee_center="peak"``, EE centers the aperture at the coordinate.
+            FWHM uses the enclosing contour at half the sampled intensity.
         peak_refinement_factor: Positive integer sampling multiplier for
             ``"fourier_max"`` and supplied peak coordinates (default 4).
             One uses the native grid. Validated for all methods.
@@ -1439,8 +1446,13 @@ def compute_psf_stats(
             Validated for both methods, but unused by ``"contour"``.
         fwhm_summary: FWHM contour summary selector: ``"geom"``, ``"mean"``,
             ``"min"``, or ``"max"``.
-        ee_geometry: EE aperture geometry. Defaults to ``"ensquared"`` to
-            preserve the existing square-aperture statistic.
+        ee_geometry: EE aperture geometry. Defaults to ``"ensquared"``.
+            Square apertures extrapolate beyond the sampled curve, or return
+            the sole sample when the curve contains just one.
+        ee_center: Center the EE aperture at the supplied or estimated peak
+            (``"peak"``, default) or the geometric image center (``"image"``).
+            Image centering uses the midpoint between the middle pixels on
+            even-sized axes. This option affects EE only.
         preprocess: Preprocessing control. ``"default"`` clips negative
             pixels and sum-normalizes every positive-flux PSF. ``None`` leaves
             already prepared PSFs unchanged. A callable with signature
@@ -1500,6 +1512,8 @@ def compute_psf_stats(
     fwhm_refinement_factor = _require_fwhm_refinement_factor(fwhm_refinement_factor)
     fwhm_summary = _require_fwhm_summary(fwhm_summary)
     ee_geometry = _normalize_ee_geometry(ee_geometry)
+    if not isinstance(ee_center, str) or ee_center not in EE_CENTERS:
+        raise ValueError('ee_center must be "peak" or "image".')
     psf_cube = _apply_preprocess(psf_cube, preprocess)
     _validate_flux_inputs(psf_cube, metrics)
 
@@ -1521,6 +1535,7 @@ def compute_psf_stats(
             fwhm_refinement_factor=fwhm_refinement_factor,
             fwhm_summary=fwhm_summary,
             ee_geometry=ee_geometry,
+            ee_center=ee_center,
             metrics=metrics,
             peak_locations_yx=peak_locations,
         )
@@ -1548,6 +1563,7 @@ def compute_psf_stats(
                 fwhm_refinement_factor=fwhm_refinement_factor,
                 fwhm_summary=fwhm_summary,
                 ee_geometry=ee_geometry,
+                ee_center=ee_center,
                 metrics=metrics,
                 peak_locations_yx=(
                     peak_locations[index : index + 1]
@@ -1618,6 +1634,7 @@ def compute_psf_ee(
     peak_method: str = DEFAULT_PEAK_METHOD,
     peak_refinement_factor: int = DEFAULT_PEAK_REFINEMENT_FACTOR,
     ee_geometry: str = DEFAULT_EE_GEOMETRY,
+    ee_center: Literal["peak", "image"] = DEFAULT_EE_CENTER,
     preprocess: PsfPreprocessOption = "default",
     dtype: DTypeLike = np.float32,
 ) -> StatValue:
@@ -1636,6 +1653,9 @@ def compute_psf_ee(
             multiplier (default 4); one gives the native maximum. Validated
             even when unused by the selected estimator.
         ee_geometry: Aperture geometry, ``"ensquared"`` or ``"encircled"``.
+        ee_center: Center the aperture at the estimated peak (``"peak"``,
+            default) or the geometric image center (``"image"``). On even-sized
+            axes, the image center is halfway between the middle pixels.
         preprocess: Preprocessing control accepted by ``compute_psf_stats``.
 
     Returns:
@@ -1657,6 +1677,7 @@ def compute_psf_ee(
         peak_method=peak_method,
         peak_refinement_factor=peak_refinement_factor,
         ee_geometry=ee_geometry,
+        ee_center=ee_center,
         preprocess=preprocess,
         dtype=dtype,
         metrics=(STATS_METRIC_EE,),

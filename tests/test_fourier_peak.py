@@ -3,6 +3,7 @@
 import numpy as np
 import pytest
 from astropy import units as u
+from photutils.aperture import CircularAperture
 
 import ao_stats.psf as module
 from ao_stats import (
@@ -265,6 +266,106 @@ def test_supplied_peak_rejects_negative_strehl_sample():
     assert zero.value == 0
     with pytest.raises(ValueError, match="negative Strehl intensity"):
         compute_psf_stats(psf, metadata, peak_locations=(13.5, 13), **options)
+
+
+@pytest.mark.parametrize("shape", [(41, 43), (42, 44)])
+def test_image_centered_ensquared_energy_matches_supplied_midpoint(shape):
+    image, metadata, _ = optical_psf(shape=shape, offset=(4.5, -3.5))
+    options = dict(
+        ee_apertures=[50, 100] * u.mas,
+        preprocess=None,
+        dtype=np.float64,
+    )
+    midpoint = (np.asarray(shape) - 1) / 2
+    (expected,) = compute_psf_stats(
+        image, metadata, peak_locations=midpoint, metrics=("ee",), **options,
+    )
+    fixed = compute_psf_ee(image, metadata, ee_center="image", **options)
+    automatic = compute_psf_ee(image, metadata, **options)
+    explicit_peak = compute_psf_ee(image, metadata, ee_center="peak", **options)
+    np.testing.assert_array_equal(fixed, expected)
+    np.testing.assert_array_equal(automatic, explicit_peak)
+    assert np.all(fixed < automatic)
+
+
+@pytest.mark.parametrize("centering", ["image", "estimated_peak", "supplied_peak"])
+def test_encircled_energy_integrates_native_pixels(centering):
+    y, x = np.indices((40, 40))
+    center = 19.5
+    psf = np.exp(-((y - center) ** 2 + (x - center) ** 2) / (2 * 0.5 ** 2))
+    psf /= psf.sum()
+    diameters = np.array([4, 8])
+    options = dict(
+        pixel_scale=1 * u.mas, ee_apertures=diameters * u.mas,
+        ee_geometry="encircled", preprocess=None, dtype=np.float64,
+    )
+    if centering == "image":
+        location = (center, center)
+        actual = compute_psf_ee(psf, ee_center="image", **options)
+    elif centering == "estimated_peak":
+        location = module._compute_peak_locations(psf[None], DEFAULT_PEAK_METHOD)[0]
+        actual = compute_psf_ee(psf, **options)
+    else:
+        location = (18.75, 20.25)
+        (actual,) = compute_psf_stats(
+            psf, peak_locations=location, metrics=("ee",), **options,
+        )
+    expected = [
+        CircularAperture(tuple(reversed(location)), diameter / 2)
+        .do_photometry(psf, method="exact")[0][0]
+        for diameter in diameters
+    ]
+    np.testing.assert_allclose(actual.value, expected, rtol=1e-13)
+    assert np.all(actual.value <= 1 + np.finfo(np.float64).eps)
+
+
+@pytest.mark.parametrize("peak_method", ["gaussian_fit", "fourier_max"])
+@pytest.mark.parametrize("supplied", [False, True])
+def test_image_centered_ee_keeps_sr_and_fwhm(peak_method, supplied):
+    image, metadata, _ = optical_psf(offset=(4.5, -3.5))
+    psfs = np.stack([image, image * 0.7])
+    options = dict(
+        ee_apertures=[[50], [100]] * u.mas,
+        peak_method=peak_method,
+        peak_locations=[(24.5, 17.5)] * len(psfs) if supplied else None,
+        fwhm_method="fourier_contour",
+        preprocess=None,
+        dtype=np.float64,
+    )
+    sr, ee, fwhm = compute_psf_stats(psfs, metadata, **options)
+    fixed_sr, fixed_ee, fixed_fwhm = compute_psf_stats(
+        psfs, metadata, ee_center="image", **options,
+    )
+    ee_only = compute_psf_ee(
+        psfs, metadata, ee_apertures=options["ee_apertures"],
+        ee_center="image", preprocess=None, dtype=np.float64,
+    )
+    np.testing.assert_array_equal(fixed_sr, sr)
+    np.testing.assert_array_equal(fixed_fwhm, fwhm)
+    np.testing.assert_array_equal(fixed_ee, ee_only)
+    assert np.all(fixed_ee < ee)
+
+
+def test_image_centered_ee_only_skips_fourier_peak_search(monkeypatch):
+    image, metadata, _ = optical_psf()
+
+    def unexpected_refinement(*args, **kwargs):
+        pytest.fail("Image-centered EE should not need Fourier refinement.")
+
+    monkeypatch.setattr(module, "_refine_psf", unexpected_refinement)
+    result = compute_psf_ee(
+        image, metadata, ee_apertures=[100] * u.mas,
+        peak_method="fourier_max", ee_center="image",
+    )
+    assert np.isfinite(result.value)
+
+
+def test_reject_invalid_ee_center():
+    with pytest.raises(ValueError, match="ee_center"):
+        compute_psf_ee(
+            np.ones((9, 9)), pixel_scale=1 * u.mas,
+            ee_apertures=[5] * u.mas, ee_center="centroid",
+        )
 
 
 @pytest.mark.parametrize("per_psf", [False, True])

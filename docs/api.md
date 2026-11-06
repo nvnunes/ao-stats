@@ -91,11 +91,8 @@ may be fractional within the first and last native pixel centers on each axis.
   Fourier diffraction reference at that refinement and rejects negative
   samples. FWHM measures the enclosing contour at half the sampled intensity
   using the selected [contour method](#fwhm-sampling).
-- **Enclosed energy** centers the aperture at the supplied position. For
-  square apertures, each PSF's curve stops at the largest sampled aperture
-  that fits in its image. For larger requested apertures, the returned
-  energy is extrapolated and clipped to `[0, 1]`. If the curve has just
-  one sample, AO Stats returns that value for every requested aperture.
+- **Enclosed energy** uses the supplied position with `ee_center="peak"`.
+  With `ee_center="image"`, the aperture stays at the cutout midpoint.
 
 ## Measurement Options
 
@@ -105,6 +102,7 @@ may be fractional within the first and last native pixel centers on each axis.
 | Peak refinement factor | Positive integer | `4` | — |
 | Strehl ratio | Automatic or supplied peak | — | dimensionless |
 | Enclosed energy geometry | `ensquared`, `encircled` | `ensquared` | dimensionless |
+| Enclosed energy center | `peak`, `image` | `peak` | — |
 | FWHM method | `contour`, `fourier_contour` | `contour` | milliarcseconds |
 | FWHM refinement factor | Positive integer | `4` | — |
 | FWHM summary | `geom`, `mean`, `min`, `max` | `geom` | milliarcseconds |
@@ -113,8 +111,8 @@ For automatic peak selection, `gaussian_fit` locates the brightest pixel
 in each PSF and fits a Gaussian within a 5×5 patch around it, regardless of
 image parity. At an image edge, the patch shifts inward to keep its full
 size. Axes shorter than five pixels use all available pixels. The fitted
-amplitude feeds Strehl and the fitted subpixel location centers
-enclosed-energy apertures. Strehl uses the same
+amplitude feeds Strehl and the fitted subpixel location centers apertures
+in peak-centered EE. Strehl uses the same
 estimator for the diffraction-limited reference. `pixel_max` uses the brightest
 pixel's value and integer location directly.
 
@@ -123,9 +121,30 @@ difference is within metadata roundoff at the selected precision. Genuinely frac
 is truncated toward zero. This preserves the intended Fourier grid when
 physical metadata describe an integer padding size.
 
+### Enclosed Energy
+
+In `compute_psf_ee` and `compute_psf_stats`, the default `ee_center="peak"`
+uses the estimated peak or the position supplied to `compute_psf_stats`.
+Use `ee_center="image"` when the source is nominally at the center of the
+cutout, as in a source-centered simulation. The aperture stays at the geometric
+image center, halfway between the middle pixels on even-sized axes. Motion
+of the PSF core relative to the source contributes to the measurement.
+SR and FWHM use their own peak and contour settings.
+
 `ee_apertures` contains aperture diameters in angular units. Supply a
 one-dimensional array to use the same apertures for every PSF, or an `[M, A]`
 array to use `A` aperture sizes for each PSF in a cube.
+
+Square apertures sample a cumulative curve up to the largest sampled aperture
+that fits in the image. A cube measured with automatic peaks, shared apertures,
+and shared metadata uses the smallest such limit across its PSFs. With peak
+centering, supplied positions give each PSF its own limit. Larger requested
+apertures use extrapolation clipped to `[0, 1]`. A curve with one sample returns
+that value at every requested diameter.
+
+Circular apertures integrate the native pixels directly at either selected
+center. Peak-centered circular EE at fractional locations can differ from
+older AO Stats results, which resampled the image before integration.
 
 ### Fourier Peak Estimation
 
@@ -154,9 +173,11 @@ grid. The default automatic peak estimator is `gaussian_fit`.
 
 Peak estimation and Fourier FWHM share the padding and resampling operation
 described below. AO Stats searches for the maximum within the original sample
-extent and converts its location back to native pixels. Enclosed energy
-centers the aperture using the native-grid PSF. Fourier refinement preserves
-interpolation undershoots and skips repeated preprocessing.
+extent and converts its location back to native pixels. With `ee_center="peak"`,
+EE centers the aperture at that location. With `ee_center="image"`, EE uses
+the cutout midpoint. See [Enclosed Energy](#enclosed-energy) for aperture
+integration. Fourier refinement preserves interpolation undershoots and skips
+repeated preprocessing.
 
 Strehl applies the same peak estimator to a diffraction-limited reference
 normalized over its complete Fourier plane. Before interpolation the reference
